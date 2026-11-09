@@ -6,9 +6,21 @@ Sage Bot is being developed to help teams find answers and take action through c
 
 ## Project status
 
-This repository is at the initialization stage. It currently contains project information and licensing only; there is no runnable application, supported release, or installation procedure yet.
+This repository is at an early development stage. It currently provides an HTTP server with a liveness endpoint only; there is no supported release or installation procedure yet.
 
 Implementation will arrive through small, focused pull requests. Planned capabilities described here are goals, not available features.
+
+## Run the HTTP server
+
+From a development environment set up with `make setup`:
+
+```sh
+uv run sage-bot-server                 # binds 127.0.0.1:8000
+uv run sage-bot-server --host 0.0.0.0 --port 9000
+curl http://127.0.0.1:8000/health/live # {"status":"ok"}
+```
+
+The server binds to the local interface unless `--host` is given. Port `0` picks a free port. The server does not send a `Server` header, does not trust forwarded headers, and does not write an access log, since request lines can carry credentials. Once the server has started, SIGTERM and Ctrl+C both shut it down gracefully: the process then exits with status 0 after SIGTERM and 130 after Ctrl+C. A signal that arrives while the process is still starting stops it with the default signal status. `python -m sage_bot.api.server` is equivalent.
 
 ## Direction
 
