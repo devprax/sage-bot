@@ -45,9 +45,10 @@ paths:
       operationId: health_ready
       summary: Report readiness
       description: |-
-        Reports whether the service can do work: its settings are valid and PostgreSQL answers a
-        query within the configured readiness timeout. Reveals no reason, version or internal
-        details; liveness is unaffected.
+        Reports whether the service can do work: its settings are valid and, within the configured
+        readiness timeout, PostgreSQL reports the database schema revision this release expects
+        (apply it with `sage-bot-migrate`). Reveals no reason, version or internal details;
+        liveness is unaffected.
       security: []
       responses:
         '200':

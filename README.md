@@ -15,13 +15,16 @@ Implementation will arrive through small, focused pull requests. Planned capabil
 From a development environment set up with `make setup`:
 
 ```sh
+uv run sage-bot-migrate                # upgrades the database schema (uses DATABASE_URL)
 uv run sage-bot-server                 # binds 127.0.0.1:8000
 uv run sage-bot-server --host 0.0.0.0 --port 9000
 curl http://127.0.0.1:8000/health/live  # {"status":"ok"}
 curl http://127.0.0.1:8000/health/ready # {"status":"ok"} or 503 {"status":"not_ready"}
 ```
 
-`/health/live` answers whenever the process is running and needs no configuration. `/health/ready` returns `200` only when the settings (`DATABASE_URL`, `SAGE_ENCRYPTION_KEY`) are valid and PostgreSQL answers a query within `READINESS_TIMEOUT_SECONDS` (default 2). Otherwise it returns `503` without saying why. The reason is logged by error type only, never with values. Settings are read when the server starts, so changing them requires a restart.
+`/health/live` answers whenever the process is running and needs no configuration. `/health/ready` returns `200` only when the settings (`DATABASE_URL`, `SAGE_ENCRYPTION_KEY`) are valid and, within `READINESS_TIMEOUT_SECONDS` (default 2), PostgreSQL reports the database schema revision this release expects. Otherwise it returns `503` without saying why. The reason is logged by error type only, never with values. Settings are read when the server starts, so changing them requires a restart.
+
+Schema migrations are an explicit step: run `sage-bot-migrate` (or `python -m sage_bot.db.migrate`) before starting a release. It is idempotent, needs the same settings as the server, and reports failures by error type only. Concurrent runs are serialized by a database lock. A run that waits more than 60 seconds for another runner fails instead of hanging. The server never migrates on startup; readiness stays `503` until the schema is at the expected revision.
 
 The server binds to the local interface unless `--host` is given. Port `0` picks a free port. The server does not send a `Server` header, does not trust forwarded headers, and does not write an access log, since request lines can carry credentials. Once the server has started, SIGTERM and Ctrl+C both shut it down gracefully: the process then exits with status 0 after SIGTERM and 130 after Ctrl+C. A signal that arrives while the process is still starting stops it with the default signal status. `python -m sage_bot.api.server` is equivalent.
 
