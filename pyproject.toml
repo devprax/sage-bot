@@ -14,7 +14,11 @@ dependencies = [
   "fastapi==0.162.0",
   "pydantic==2.12.5",
   "pydantic-settings==2.14.2",
+  "uvicorn==0.54.0",
 ]
+
+[project.scripts]
+sage-bot-server = "sage_bot.api.server:main"
 
 [project.urls]
 Repository = "https://github.com/devprax/sage-bot"
