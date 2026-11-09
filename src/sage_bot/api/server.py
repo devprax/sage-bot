@@ -13,6 +13,7 @@ from types import FrameType
 import uvicorn
 
 from sage_bot.api.app import create_app
+from sage_bot.api.readiness import readiness_from_environment
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -55,7 +56,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def build_server(host: str, port: int) -> uvicorn.Server:
     config = uvicorn.Config(
-        create_app(),
+        # Readiness reports not ready when settings are missing; liveness never needs them.
+        create_app(readiness=readiness_from_environment()),
         host=host,
         port=port,
         # Do not advertise the server software.

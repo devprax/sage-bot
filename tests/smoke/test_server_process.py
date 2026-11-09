@@ -99,6 +99,11 @@ def test_server_starts_answers_liveness_and_shuts_down_cleanly(
         assert body == b'{"status":"ok"}'
         assert _get(port, "/docs")[0].status == 404
 
+        # Started without settings: alive, but not ready, and without saying why.
+        ready, ready_body = _get(port, "/health/ready")
+        assert ready.status == 503
+        assert ready_body == b'{"status":"not_ready"}'
+
         process.send_signal(stop)
         assert process.wait(timeout=SHUTDOWN_TIMEOUT) == exit_status
     finally:

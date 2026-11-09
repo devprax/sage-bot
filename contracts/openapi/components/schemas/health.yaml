@@ -6,3 +6,11 @@ Liveness:
   properties:
     status:
       const: ok
+Readiness:
+  type: object
+  description: Whether the service can do work. A not-ready response gives no reason.
+  required: [status]
+  additionalProperties: false
+  properties:
+    status:
+      enum: [ok, not_ready]

@@ -192,6 +192,15 @@ def test_liveness_schema_is_closed_to_unimplemented_states() -> None:
     assert not liveness.is_valid({})
 
 
+def test_readiness_schema_accepts_only_its_states() -> None:
+    readiness = _validator({"$ref": "#/components/schemas/Readiness"})
+    assert readiness.is_valid({"status": "ok"})
+    assert readiness.is_valid({"status": "not_ready"})
+    assert not readiness.is_valid({"status": "degraded"})
+    assert not readiness.is_valid({"status": "not_ready", "reason": "database down"})
+    assert not readiness.is_valid({})
+
+
 # Regression tests: drift detection must see inputs that only dependencies introduce.
 
 
