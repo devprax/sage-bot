@@ -26,6 +26,38 @@ Introduce the project scaffold and development tooling first, then add behavior 
 
 Pull requests use squash merging. Describe the outcome, validation, and compatibility impact in each PR so its final commit is meaningful.
 
+## API contract
+
+The HTTP contract describes only the operations Sage Bot implements. Its source is the modular OpenAPI tree in `contracts/openapi/`. `contracts/openapi.yaml` is generated from it, so do not edit that file by hand.
+
+- Run `make contract` after editing the source.
+- A pull request that adds or changes an endpoint updates its implementation, contract, and tests together, and states any compatibility impact.
+
+The application does not publish its schema or interactive docs; the contract lives in the repository. `make check` compares the contract with the application's route table in process.
+
+It fails when:
+
+- The bundle is stale, is not valid OpenAPI 3.1, or has an unresolved reference.
+- The served and declared operations (path and method) differ.
+- An operation's effective inputs differ from the contract in parameter name, location, or required flag, or in whether a request body is read.
+  - Effective inputs are what FastAPI resolves for the route: its own signature plus dependencies at any depth, whether attached to the endpoint, the route, or the application.
+  - Parameter models are expanded into their fields.
+  - The checks derive these inputs from a per-route operation that FastAPI generates in process; the application never publishes it.
+- An operation's declared status codes differ from that operation's codes, which include FastAPI's automatic `422` whenever the route has an effective input.
+- A response obtained by calling an operation without inputs has an undeclared status code, a media type other than the declared one, or a body that does not validate against the declared schema. A `HEAD` response must also have the status and headers of `GET` and no body.
+
+It does not yet compare:
+
+- Parameter and request-body schemas.
+- The `422` body.
+- Other response headers.
+- Security requirements.
+- Status codes raised only at runtime.
+- Inputs an endpoint reads directly from the `Request` object, including credentials read by security schemes.
+- Parameters hidden with `include_in_schema=False`.
+
+Endpoints that rely on these need their own tests. Routers added with `include_router` are not yet supported: the route-table check rejects them, so the checks fail rather than silently skipping a route.
+
 ## Contributing and support
 
 DevPrax maintains shared community guidance:
