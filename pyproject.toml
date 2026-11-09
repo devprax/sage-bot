@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling==1.28.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sage-bot"
+version = "0.1.0.dev0"
+description = "An open-source AI assistant for Slack"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/devprax/sage-bot"
+Issues = "https://github.com/devprax/sage-bot/issues"
+
+[dependency-groups]
+dev = [
+  "ruff==0.14.13",
+  "ty==0.0.99",
+]
+
+[tool.uv]
+required-version = "==0.13.7"
+default-groups = ["dev"]
+index-strategy = "first-index"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sage_bot"]
+
+[tool.ruff]
+required-version = "==0.14.13"
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "ASYNC", "S", "RUF100"]
+
+[tool.ty.environment]
+python-version = "3.12"
+root = ["./src"]
+
+[tool.ty.src]
+include = ["src"]
+
+[tool.ty.rules]
+all = "error"
+
+[tool.ty.terminal]
+error-on-warning = true
