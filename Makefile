@@ -1,6 +1,6 @@
 UV ?= uv
 
-.PHONY: setup lock lock-check lint format typecheck build check
+.PHONY: setup lock lock-check lint format typecheck test build check
 
 setup:
 	$(UV) sync --locked
@@ -23,7 +23,10 @@ format:
 typecheck:
 	$(UV) run --locked ty check
 
+test:
+	$(UV) run --locked pytest
+
 build:
 	$(UV) build --no-sources
 
-check: lock-check lint typecheck
+check: lock-check lint typecheck test
