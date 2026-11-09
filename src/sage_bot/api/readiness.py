@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 # Identifies probe connections in pg_stat_activity.
 APPLICATION_NAME = "sage-bot-readiness"
+# Bound for releasing a probe after its deadline. Closing is local, and psycopg ends the query
+# at its next poll (tens of milliseconds). Only if it did not would a response exceed the
+# deadline, by at most 2 * CLEANUP_SECONDS.
+CLEANUP_SECONDS = 1.0
 
 type ReadinessCheck = Callable[[], Coroutine[Any, Any, bool]]
 
@@ -39,17 +43,32 @@ def postgres_check(database_url: str, *, timeout_seconds: float) -> ReadinessChe
     in_flight: asyncio.Task[bool] | None = None
 
     async def probe() -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        connection: psycopg.AsyncConnection[Any] | None = None
+        query: asyncio.Task[Any] | None = None
         try:
-            async with asyncio.timeout(timeout_seconds):
-                async with await psycopg.AsyncConnection.connect(
+            async with asyncio.timeout_at(deadline):
+                connection = await psycopg.AsyncConnection.connect(
                     database_url,
+                    # No transaction, so closing never needs a rollback round trip.
+                    autocommit=True,
                     connect_timeout=connect_timeout,
                     application_name=APPLICATION_NAME,
-                ) as connection:
-                    await connection.execute("SELECT 1")
+                )
+            # The query is never cancelled: psycopg answers cancellation with a server-side
+            # cancel request and further waiting, which the deadline would not bound. If the
+            # deadline passes, closing the connection ends the query instead.
+            query = asyncio.create_task(connection.execute("SELECT 1"))
+            done, _ = await asyncio.wait({query}, timeout=max(0.0, deadline - loop.time()))
+            if query not in done:
+                raise TimeoutError
+            await query
         except Exception as error:  # any failure means not ready
             logger.warning("readiness: database check failed (%s)", type(error).__name__)
             return False
+        finally:
+            await _discard(connection, query)
         return True
 
     async def check() -> bool:
@@ -65,6 +84,26 @@ def postgres_check(database_url: str, *, timeout_seconds: float) -> ReadinessChe
         return await asyncio.shield(in_flight)
 
     return check
+
+
+async def _discard(
+    connection: psycopg.AsyncConnection[Any] | None, query: asyncio.Task[Any] | None
+) -> None:
+    """Release a probe's connection and query without waiting on the server."""
+    if connection is not None:
+        # libpq's PQfinish: closes the socket locally and does not wait for the server.
+        await connection.close()
+    if query is None:
+        return
+    if not query.done():
+        # With its socket closed, the query fails at psycopg's next poll; bound the wait.
+        await asyncio.wait({query}, timeout=CLEANUP_SECONDS)
+    if not query.done():
+        # Last resort. The connection is closed, so psycopg sends no cancel request.
+        query.cancel()
+        await asyncio.wait({query}, timeout=CLEANUP_SECONDS)
+    if query.done() and not query.cancelled():
+        query.exception()  # retrieved, so asyncio does not report it as unhandled
 
 
 def readiness_from_environment() -> ReadinessCheck:

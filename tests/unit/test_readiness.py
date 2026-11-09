@@ -5,8 +5,10 @@ import os
 import socket
 import time
 from collections.abc import Iterator
+from types import CoroutineType
 
 import pytest
+from fake_postgres import FakePostgres, fake_postgres
 from fastapi.testclient import TestClient
 
 from sage_bot.api.app import create_app
@@ -155,6 +157,9 @@ class _FakeConnection:
     async def execute(self, query: str) -> None:
         return None
 
+    async def close(self) -> None:
+        return None
+
 
 def test_concurrent_probes_share_one_database_check(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts: list[dict[str, object]] = []
@@ -214,3 +219,71 @@ def test_a_probe_left_on_a_closed_event_loop_is_not_reused(
         first.close()
 
     assert asyncio.run(asyncio.wait_for(check(), timeout=5)) is True
+
+
+def _probe_tasks() -> list[asyncio.Task[object]]:
+    def probe_code(task: asyncio.Task[object]) -> bool:
+        coroutine = task.get_coro()
+        if not isinstance(coroutine, CoroutineType):
+            return False
+        filename = coroutine.cr_code.co_filename
+        return filename.endswith("readiness.py") or "/psycopg/" in filename
+
+    return [task for task in asyncio.all_tasks() if not task.done() and probe_code(task)]
+
+
+def test_a_stalled_probe_leaves_no_task_behind(stalling_database: FakePostgres) -> None:
+    check = postgres_check(_url(stalling_database.port), timeout_seconds=0.3)
+
+    async def probe_and_count() -> tuple[bool, int]:
+        before = asyncio.all_tasks()
+        result = await check()
+        return result, len(asyncio.all_tasks() - before)
+
+    assert asyncio.run(asyncio.wait_for(probe_and_count(), timeout=5)) == (False, 0)
+
+
+@pytest.fixture
+def stalling_database() -> Iterator[FakePostgres]:
+    with fake_postgres() as server:
+        yield server
+
+
+def test_query_stalled_after_the_handshake_is_bounded_and_recovers(
+    stalling_database: FakePostgres, caplog: pytest.LogCaptureFixture
+) -> None:
+    timeout = 0.5
+    check = postgres_check(_url(stalling_database.port), timeout_seconds=timeout)
+    leftover_tasks: list[int] = []
+
+    async def counted_check() -> bool:
+        result = await check()
+        # Nothing the probe started may still be running once it has answered. The test
+        # client runs its own tasks, so count only those executing readiness or psycopg code.
+        leftover_tasks.append(len(_probe_tasks()))
+        return result
+
+    client = TestClient(create_app(readiness=counted_check))
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            started = time.monotonic()
+            response = client.get("/health/ready")
+            elapsed = time.monotonic() - started
+            assert response.status_code == 503
+            assert response.json() == {"status": "not_ready"}
+            assert elapsed < timeout + 1.0, f"503 took {elapsed:.2f}s"
+            # The stalled connection is closed promptly, not left for the server to drop.
+            assert stalling_database.wait_until_closed(timeout=1.0)
+
+    assert leftover_tasks == [0, 0, 0]
+    # The deadline is enforced by closing the connection, not by psycopg's cancel protocol,
+    # whose extra waiting would not be bounded by the readiness timeout.
+    assert stalling_database.cancel_requests == 0
+    assert [r.getMessage() for r in caplog.records if r.name.startswith("psycopg")] == []
+    assert caplog.text.count("database check failed (TimeoutError)") == 3
+
+    stalling_database.stall = False
+    recovered = client.get("/health/ready")
+    assert recovered.status_code == 200
+    assert recovered.json() == {"status": "ok"}
+    assert stalling_database.wait_until_closed(timeout=1.0)
