@@ -39,6 +39,40 @@ paths:
       responses:
         '200':
           description: The HTTP service is running.
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: health_ready
+      summary: Report readiness
+      description: |-
+        Reports whether the service can do work: its settings are valid and PostgreSQL answers a
+        query within the configured readiness timeout. Reveals no reason, version or internal
+        details; liveness is unaffected.
+      security: []
+      responses:
+        '200':
+          description: The service is ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: The service is not ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+    head:
+      tags: [Health]
+      operationId: health_ready_head
+      summary: Report readiness without a body
+      description: Same status and headers as `GET /health/ready`, with an empty body.
+      security: []
+      responses:
+        '200':
+          description: The service is ready.
+        '503':
+          description: The service is not ready.
 components:
   schemas:
     Liveness:
@@ -49,3 +83,11 @@ components:
       properties:
         status:
           const: ok
+    Readiness:
+      type: object
+      description: Whether the service can do work. A not-ready response gives no reason.
+      required: [status]
+      additionalProperties: false
+      properties:
+        status:
+          enum: [ok, not_ready]

@@ -42,7 +42,7 @@ def test_server_serves_the_application_without_identifying_itself() -> None:
     assert config.proxy_headers is False
     assert config.access_log is False  # request lines can carry credentials in query strings
     assert isinstance(config.app, FastAPI)
-    assert {route.path for route in config.app.routes} == {"/health/live"}  # ty: ignore[unresolved-attribute]
+    assert {route.path for route in config.app.routes} == {"/health/live", "/health/ready"}  # ty: ignore[unresolved-attribute]
     assert config.app.openapi_url is None
 
 

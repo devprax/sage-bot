@@ -17,10 +17,24 @@ From a development environment set up with `make setup`:
 ```sh
 uv run sage-bot-server                 # binds 127.0.0.1:8000
 uv run sage-bot-server --host 0.0.0.0 --port 9000
-curl http://127.0.0.1:8000/health/live # {"status":"ok"}
+curl http://127.0.0.1:8000/health/live  # {"status":"ok"}
+curl http://127.0.0.1:8000/health/ready # {"status":"ok"} or 503 {"status":"not_ready"}
 ```
 
+`/health/live` answers whenever the process is running and needs no configuration. `/health/ready` returns `200` only when the settings (`DATABASE_URL`, `SAGE_ENCRYPTION_KEY`) are valid and PostgreSQL answers a query within `READINESS_TIMEOUT_SECONDS` (default 2). Otherwise it returns `503` without saying why. The reason is logged by error type only, never with values. Settings are read when the server starts, so changing them requires a restart.
+
 The server binds to the local interface unless `--host` is given. Port `0` picks a free port. The server does not send a `Server` header, does not trust forwarded headers, and does not write an access log, since request lines can carry credentials. Once the server has started, SIGTERM and Ctrl+C both shut it down gracefully: the process then exits with status 0 after SIGTERM and 130 after Ctrl+C. A signal that arrives while the process is still starting stops it with the default signal status. `python -m sage_bot.api.server` is equivalent.
+
+### PostgreSQL integration tests
+
+These tests run when `SAGE_TEST_DATABASE_URL` points to a disposable database. Otherwise they are skipped locally, and they fail in CI, which provides a PostgreSQL service. For example, with Podman (or Docker):
+
+```sh
+podman run -d --rm --name sage-test-db -p 127.0.0.1:55432:5432 \
+  -e POSTGRES_USER=sage_test -e POSTGRES_PASSWORD=sage_test_password -e POSTGRES_DB=sage_test \
+  postgres:17.10
+SAGE_TEST_DATABASE_URL=postgresql://sage_test:sage_test_password@127.0.0.1:55432/sage_test make check
+```
 
 ## Direction
 

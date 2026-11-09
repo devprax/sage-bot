@@ -23,3 +23,37 @@ live:
     responses:
       '200':
         description: The HTTP service is running.
+ready:
+  get:
+    tags: [Health]
+    operationId: health_ready
+    summary: Report readiness
+    description: |-
+      Reports whether the service can do work: its settings are valid and PostgreSQL answers a
+      query within the configured readiness timeout. Reveals no reason, version or internal
+      details; liveness is unaffected.
+    security: []
+    responses:
+      '200':
+        description: The service is ready.
+        content:
+          application/json:
+            schema:
+              $ref: ../components/schemas/health.yaml#/Readiness
+      '503':
+        description: The service is not ready.
+        content:
+          application/json:
+            schema:
+              $ref: ../components/schemas/health.yaml#/Readiness
+  head:
+    tags: [Health]
+    operationId: health_ready_head
+    summary: Report readiness without a body
+    description: Same status and headers as `GET /health/ready`, with an empty body.
+    security: []
+    responses:
+      '200':
+        description: The service is ready.
+      '503':
+        description: The service is not ready.

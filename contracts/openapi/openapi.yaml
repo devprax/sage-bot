@@ -14,3 +14,5 @@ tags:
 paths:
   /health/live:
     $ref: paths/health.yaml#/live
+  /health/ready:
+    $ref: paths/health.yaml#/ready
