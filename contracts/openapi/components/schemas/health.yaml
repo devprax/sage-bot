@@ -1,0 +1,8 @@
+Liveness:
+  type: object
+  description: Liveness has a single state; failure is the absence of a response.
+  required: [status]
+  additionalProperties: false
+  properties:
+    status:
+      const: ok

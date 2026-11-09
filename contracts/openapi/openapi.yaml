@@ -1,0 +1,16 @@
+openapi: 3.1.0
+info:
+  title: Sage Bot API
+  version: 0.1.0.dev0
+  description: |-
+    HTTP contract for the operations Sage Bot implements. Each endpoint is added here in the
+    same change that implements and tests it.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+tags:
+  - name: Health
+    description: Unauthenticated process probes.
+paths:
+  /health/live:
+    $ref: paths/health.yaml#/live

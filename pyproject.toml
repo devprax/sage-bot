@@ -23,9 +23,13 @@ Issues = "https://github.com/devprax/sage-bot/issues"
 [dependency-groups]
 dev = [
   "httpx2==2.16.0",
+  "jsonschema==4.26.0",
+  "openapi-spec-validator==0.9.0",
   "pytest==9.0.3",
+  "pyyaml==6.0.3",
   "ruff==0.14.13",
   "ty==0.0.99",
+  "types-pyyaml==6.0.12.20260906",
 ]
 
 [tool.uv]
@@ -52,7 +56,7 @@ python-version = "3.12"
 root = ["./src"]
 
 [tool.ty.src]
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
 
 [tool.ty.rules]
 all = "error"

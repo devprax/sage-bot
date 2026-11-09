@@ -1,0 +1,25 @@
+live:
+  get:
+    tags: [Health]
+    operationId: health_live
+    summary: Report liveness
+    description: |-
+      Confirms the HTTP service is running. Reads no configuration, contacts no database or
+      external service, and reveals no version or internal details.
+    security: []
+    responses:
+      '200':
+        description: The HTTP service is running.
+        content:
+          application/json:
+            schema:
+              $ref: ../components/schemas/health.yaml#/Liveness
+  head:
+    tags: [Health]
+    operationId: health_live_head
+    summary: Report liveness without a body
+    description: Same status and headers as `GET /health/live`, with an empty body.
+    security: []
+    responses:
+      '200':
+        description: The HTTP service is running.
