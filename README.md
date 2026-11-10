@@ -15,18 +15,58 @@ Implementation will arrive through small, focused pull requests. Planned capabil
 From a development environment set up with `make setup`:
 
 ```sh
-uv run sage-bot-migrate                # upgrades the database schema (uses DATABASE_URL)
+uv run sage-bot-migrate                # upgrades the schema (uses MIGRATION_DATABASE_URL)
 uv run sage-bot-server                 # binds 127.0.0.1:8000
 uv run sage-bot-server --host 0.0.0.0 --port 9000
 curl http://127.0.0.1:8000/health/live  # {"status":"ok"}
 curl http://127.0.0.1:8000/health/ready # {"status":"ok"} or 503 {"status":"not_ready"}
 ```
 
-`/health/live` answers whenever the process is running and needs no configuration. `/health/ready` returns `200` only when the settings (`DATABASE_URL`, `SAGE_ENCRYPTION_KEY`) are valid and, within `READINESS_TIMEOUT_SECONDS` (default 2), PostgreSQL reports the database schema revision this release expects. Otherwise it returns `503` without saying why. The reason is logged by error type only, never with values. Settings are read when the server starts, so changing them requires a restart.
+`/health/live` answers whenever the process is running and needs no configuration. `/health/ready` returns `200` only when the settings (`DATABASE_URL`, `SAGE_ENCRYPTION_KEY`) are valid and, within `READINESS_TIMEOUT_SECONDS` (default 2), PostgreSQL reports the database schema revision this release expects and the `DATABASE_URL` role passes the runtime role check (see [Database credentials](#database-credentials)). Otherwise it returns `503` without saying why. The reason is logged by error type or fixed problem code only, never with values. Settings are read when the server starts, so changing them requires a restart.
 
-Schema migrations are an explicit step: run `sage-bot-migrate` (or `python -m sage_bot.db.migrate`) before starting a release. It is idempotent, needs the same settings as the server, and reports failures by error type only. Concurrent runs are serialized by a database lock. A run that waits more than 60 seconds for another runner fails instead of hanging. The server never migrates on startup; readiness stays `503` until the schema is at the expected revision.
+Schema migrations are an explicit step: run `sage-bot-migrate` (or `python -m sage_bot.db.migrate`) before starting a release. It is idempotent, needs only `MIGRATION_DATABASE_URL` (it never falls back to `DATABASE_URL`), and reports failures by error type only. Concurrent runs are serialized by a database lock. A run that waits more than 60 seconds for another runner fails instead of hanging. The server never migrates on startup; readiness stays `503` until the schema is at the expected revision and the runtime role has been granted access to it.
 
 The server binds to the local interface unless `--host` is given. Port `0` picks a free port. The server does not send a `Server` header, does not trust forwarded headers, and does not write an access log, since request lines can carry credentials. Once the server has started, SIGTERM and Ctrl+C both shut it down gracefully: the process then exits with status 0 after SIGTERM and 130 after Ctrl+C. A signal that arrives while the process is still starting stops it with the default signal status. `python -m sage_bot.api.server` is equivalent.
+
+### Database credentials
+
+The server and the migration command use different PostgreSQL roles, and neither receives the other's credentials:
+
+- `MIGRATION_DATABASE_URL`, read only by `sage-bot-migrate`, connects as the role that owns the database and its schema. The server never reads it.
+- `DATABASE_URL`, read only by the server, connects as a restricted runtime role. The server does not need, and must not be given, the migration credentials.
+
+Roles, passwords and grants belong to the deployment; Sage Bot never creates roles or grants privileges. For example, as a PostgreSQL administrator, once:
+
+```sql
+CREATE ROLE sage_owner LOGIN PASSWORD '…';
+CREATE ROLE sage_runtime LOGIN PASSWORD '…'
+  NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB;
+CREATE DATABASE sage OWNER sage_owner;
+```
+
+Then, as `sage_owner`, after each `sage-bot-migrate` (the statement is idempotent):
+
+```sql
+GRANT SELECT ON alembic_version, slack_workspaces TO sage_runtime;
+```
+
+Readiness verifies the runtime role on every probe, from its effective privileges rather than its name. The privileges of every role it belongs to count too, whether that membership confers them by inheritance, by `SET ROLE` or by `ADMIN`. Readiness reports `503` if the role:
+
+- runs as a role other than its login role, for example through a default `SET ROLE`;
+- has, directly or through a role it belongs to, superuser, `BYPASSRLS`, `REPLICATION`, `CREATEROLE` or `CREATEDB`;
+- belongs to any predefined `pg_` role, such as `pg_monitor`, `pg_read_all_data` or `pg_execute_server_program`, whose powers are not recorded as grants;
+- owns the application schema, a schema on its search path, or any table, function or type in them. This includes the database owner, which owns `public`;
+- holds any grant beyond an allow-list. The allow-list is `SELECT` on `alembic_version` and `slack_workspaces`, `USAGE` on the application schema, and `CONNECT` or `TEMPORARY` on databases. Grants checked include those on tables, columns, functions, schemas, databases, types, languages, foreign servers, large objects and tablespaces, plus default privileges for future objects and user mappings. On PostgreSQL 17, `MAINTAIN` counts too;
+- can create objects in those schemas or in the database;
+- benefits from anything the deployment granted to `PUBLIC` beyond what each object starts with. That baseline is the initial privileges PostgreSQL or an extension recorded, or else PostgreSQL's default for that kind of object. Examples include `EXECUTE` on `pg_read_binary_file` or `dblink_connect_u`, `SELECT` on `pg_statistic`, `USAGE` on a foreign server, a user mapping for `PUBLIC`, or (PostgreSQL 15 and later) a grant on a server parameter. Grants to other roles that merely spell out `PUBLIC`'s defaults are not flagged. `USAGE` on a schema other than the application schema, for example an `extensions` schema, also counts, when granted to the role or, beyond the schema's initial privileges, to `PUBLIC`;
+- cannot read `slack_workspaces`, or that table has row-level security disabled;
+- connects with `row_security` off, whether set in the options of `DATABASE_URL` or as a role or database default. This does not bypass the policy for a restricted role; it makes every tenant query on the table fail. Readiness checks the setting as the session has it and does not override it.
+
+Before PostgreSQL 15, `PUBLIC` can create objects in `public` by default, so readiness reports `503` until the deployment runs `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
+
+The check covers the runtime role's own privileges. It does not audit what the trusted owner grants or defines, such as additional row-level security policies, or views and `SECURITY DEFINER` functions that expose rows. Functions the owner defines must revoke `EXECUTE` from `PUBLIC` unless every role may run them. PostgreSQL records an extension's current privileges as its initial privileges when the extension is updated, so a grant to `PUBLIC` made before an `ALTER EXTENSION … UPDATE` is no longer reported.
+
+The problem is logged as a fixed code, such as `owns_relation`, without role names or connection values. Liveness is unaffected.
 
 ### Workspaces and tenant isolation
 
@@ -35,11 +75,11 @@ Each Slack workspace has one record in `slack_workspaces`: an internal UUID, its
 Access is split by trust:
 
 - **Provisioning** (`sage_bot.db.workspaces.PostgresWorkspaceProvisioning`) is trusted. It registers a team and finds any team without a tenant context, so it connects as the role that owns the schema, the same role that runs `sage-bot-migrate`. Registration is idempotent: registering a team again, including concurrently, returns the same workspace (`created` is true exactly once) and never changes its status.
-- **Tenant-scoped access** (`PostgresTenantWorkspaces`, `tenant_transaction`) binds each transaction to one workspace through the `sage.workspace_id` setting. Row-level security then exposes only that workspace's row; without the setting, no rows. It must connect as a separate role that does not own the tables and has neither superuser nor `BYPASSRLS`. Such a role cannot disable or change the policy. Grant it only `SELECT ON slack_workspaces`, as the owner. Never grant it `TRUNCATE`, which ignores row-level security. Write privileges would also let it learn whether another workspace's team ID exists, through the unique constraint.
+- **Tenant-scoped access** (`PostgresTenantWorkspaces`, `tenant_transaction`) binds each transaction to one workspace through the `sage.workspace_id` setting. Row-level security then exposes only that workspace's row; without the setting, no rows. It connects with `DATABASE_URL` as the restricted runtime role, which cannot disable or change the policy. Readiness rejects write privileges on the table: `TRUNCATE` ignores row-level security, and writes would reveal whether another workspace's team ID exists, through the unique constraint.
 
 The policy limits a transaction to the workspace it is bound to; it does not decide which workspace that is. Any session of the runtime role can bind itself to a workspace whose UUID it knows. It protects against unscoped or mis-scoped queries, not against stolen runtime credentials. Code must bind only to a workspace resolved on the server from an authenticated source, never from caller input.
 
-Row-level security is enabled but not forced, because the owning role is the trusted provisioning role. A SECURITY DEFINER function owned by that role bypasses the policy only when it is not forced. Resolving a Slack team to its workspace at ingress is planned as such a narrow function, executable by the runtime role; until then, only provisioning can resolve a team. Today the server and `sage-bot-migrate` share one `DATABASE_URL`, so separate migration and runtime credentials must be introduced before any code serves tenant data. These guarantees assume PostgreSQL 15 or later, where ordinary roles cannot create objects in the `public` schema; CI uses 17.
+Row-level security is enabled but not forced, because the owning role is the trusted provisioning role. A SECURITY DEFINER function owned by that role bypasses the policy only when it is not forced. Resolving a Slack team to its workspace at ingress is planned as such a narrow function, executable by the runtime role; until then, only provisioning can resolve a team. Provisioning therefore needs the owner's credentials, which the server never receives; readiness confirms that the server's own role cannot bypass the policy. Schema privileges are read from the catalog rather than assumed from the PostgreSQL version; CI uses PostgreSQL 17.
 
 ### PostgreSQL integration tests
 

@@ -12,8 +12,10 @@ from uuid import uuid4
 
 import psycopg
 import pytest
-from pg_support import TenantDatabase, url_with
+from pg_support import TenantDatabase, grant_runtime_access, url_with
 from psycopg import sql
+
+from sage_bot.db import migrate
 
 
 @pytest.fixture
@@ -84,3 +86,11 @@ def tenant_database(database_url: str) -> Iterator[TenantDatabase]:
             with psycopg.connect(database_url, autocommit=True) as admin:
                 for role in (runtime, owner):
                     admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+
+
+@pytest.fixture
+def migrated(tenant_database: TenantDatabase) -> TenantDatabase:
+    """The tenant database migrated to head by its owner, with the documented runtime grant."""
+    migrate.upgrade(tenant_database.owner_url)
+    grant_runtime_access(tenant_database.owner_url, tenant_database.runtime_role)
+    return tenant_database

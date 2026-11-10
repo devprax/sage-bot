@@ -9,7 +9,35 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _require_postgres_url(value: SecretStr) -> SecretStr:
+    raw = value.get_secret_value()
+    message = "a PostgreSQL URL with non-placeholder credentials is required"
+    try:
+        parsed = urlsplit(raw)
+        valid = (
+            parsed.scheme == "postgresql"
+            and bool(parsed.hostname)
+            and bool(parsed.username)
+            and bool(parsed.password)
+            and parsed.path not in ("", "/")
+            and (parsed.port is None or parsed.port > 0)
+            and "REPLACE_ME" not in raw
+        )
+    except ValueError:
+        # URL parser errors can include input values, including credentials.
+        raise ValueError(message) from None
+    if not valid:
+        raise ValueError(message)
+    return value
+
+
 class Settings(BaseSettings):
+    """Runtime settings for the server. They never include migration credentials.
+
+    `DATABASE_URL` must connect as the restricted runtime role; readiness rejects a role that
+    could bypass tenant isolation or change the schema.
+    """
+
     model_config = SettingsConfigDict(
         extra="forbid", frozen=True, hide_input_in_errors=True, env_file=None
     )
@@ -22,25 +50,7 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def validate_database_url(cls, value: SecretStr) -> SecretStr:
-        raw = value.get_secret_value()
-        message = "a PostgreSQL URL with non-placeholder credentials is required"
-        try:
-            parsed = urlsplit(raw)
-            valid = (
-                parsed.scheme == "postgresql"
-                and bool(parsed.hostname)
-                and bool(parsed.username)
-                and bool(parsed.password)
-                and parsed.path not in ("", "/")
-                and (parsed.port is None or parsed.port > 0)
-                and "REPLACE_ME" not in raw
-            )
-        except ValueError:
-            # URL parser errors can include input values, including credentials.
-            raise ValueError(message) from None
-        if not valid:
-            raise ValueError(message)
-        return value
+        return _require_postgres_url(value)
 
     @field_validator("encryption_key")
     @classmethod
@@ -53,3 +63,22 @@ class Settings(BaseSettings):
         if len(decoded) != 32 or len(set(decoded)) < 2:
             raise ValueError(message)
         return value
+
+
+class MigrationSettings(BaseSettings):
+    """Settings for `sage-bot-migrate` only; the server never reads them.
+
+    `MIGRATION_DATABASE_URL` connects as the role that owns the schema. There is deliberately
+    no fallback to `DATABASE_URL`.
+    """
+
+    model_config = SettingsConfigDict(
+        extra="forbid", frozen=True, hide_input_in_errors=True, env_file=None
+    )
+
+    migration_database_url: SecretStr = Field(validation_alias="MIGRATION_DATABASE_URL", repr=False)
+
+    @field_validator("migration_database_url")
+    @classmethod
+    def validate_migration_database_url(cls, value: SecretStr) -> SecretStr:
+        return _require_postgres_url(value)

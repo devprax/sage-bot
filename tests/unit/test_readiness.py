@@ -18,6 +18,7 @@ from sage_bot.api.readiness import (
     postgres_check,
     readiness_from_environment,
 )
+from sage_bot.db.runtime_role import ROLE_CHECK, ROLE_CHECK_MARKER, parse_problems
 
 # Synthetic credentials only; nothing here reaches a real database.
 PASSWORD = "readiness-test-password"  # noqa: S105
@@ -154,11 +155,26 @@ def test_valid_settings_check_the_configured_database(
 
 
 class _FakeCursor:
+    def __init__(self, query: str) -> None:
+        self._row = ("",) if ROLE_CHECK_MARKER in query else (REVISION,)
+
     async def fetchall(self) -> list[tuple[str]]:
-        return [(REVISION,)]
+        return [self._row]
+
+    async def fetchone(self) -> tuple[str]:
+        return self._row
+
+
+_QUERIES: list[str] = []
+
+
+class _FakeInfo:
+    server_version = 170000
 
 
 class _FakeConnection:
+    info = _FakeInfo()
+
     async def __aenter__(self) -> "_FakeConnection":
         return self
 
@@ -166,7 +182,8 @@ class _FakeConnection:
         return None
 
     async def execute(self, query: str) -> _FakeCursor:
-        return _FakeCursor()
+        _QUERIES.append(query)
+        return _FakeCursor(query)
 
     async def close(self) -> None:
         return None
@@ -190,6 +207,9 @@ def test_concurrent_probes_share_one_database_check(monkeypatch: pytest.MonkeyPa
     assert len(attempts) == 1, "a probe flood must not open one connection per request"
     assert attempts[0]["connect_timeout"] == 2
     assert attempts[0]["application_name"] == "sage-bot-readiness"
+    assert "options" not in attempts[0], "connection options would replace the URL's options"
+    # JIT is disabled with SET instead, after the revision matches.
+    assert "SET jit = off" in _QUERIES
     # Not cached: the next probe checks again.
     assert asyncio.run(check()) is True
     assert len(attempts) == 2
@@ -333,3 +353,38 @@ def test_database_at_another_revision_is_not_ready(
         assert asyncio.run(check()) is False
     assert "database schema is not at the expected revision" in caplog.text
     assert recorded == "" or recorded not in caplog.text
+
+
+@pytest.mark.parametrize("problems", ["superuser", "owns_relation,schema_create"])
+def test_unsafe_runtime_role_is_not_ready(
+    answering_database: FakePostgres, problems: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    answering_database.role_problems = problems
+    check = postgres_check(
+        _url(answering_database.port), timeout_seconds=2, expected_revision=REVISION
+    )
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(check()) is False
+    assert f"readiness: runtime database role is unsafe ({problems})" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
+def test_role_check_problems_outside_the_known_codes_are_not_logged(
+    answering_database: FakePostgres, caplog: pytest.LogCaptureFixture
+) -> None:
+    answering_database.role_problems = f"superuser,{PASSWORD}"
+    check = postgres_check(
+        _url(answering_database.port), timeout_seconds=2, expected_revision=REVISION
+    )
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(check()) is False
+    assert "runtime database role is unsafe (superuser,unknown)" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
+def test_the_role_check_query_carries_its_marker() -> None:
+    assert ROLE_CHECK.startswith(f"/* {ROLE_CHECK_MARKER} */")
+
+
+def test_parameter_check_problems_are_merged_without_duplicates() -> None:
+    assert parse_problems("superuser,bypassrls,superuser") == ["superuser", "bypassrls"]

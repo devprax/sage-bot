@@ -1,9 +1,10 @@
 """A minimal PostgreSQL wire-protocol server for readiness tests.
 
-It completes the startup handshake (no TLS, no password) and then either answers every query
-with one text row holding `revision` (as `SELECT version_num FROM alembic_version` would), or
-stalls without replying, which lets tests reproduce a database that accepts a query and stops
-responding. It counts open client connections and cancel requests.
+It completes the startup handshake (no TLS, no password) and then either answers each query
+with one text row, or stalls without replying, which lets tests reproduce a database that
+accepts a query and stops responding. The runtime role check gets `role_problems` (empty: a
+safe role); any other query gets `revision`, as `SELECT version_num FROM alembic_version`
+would. It counts open client connections and cancel requests.
 """
 
 import socket
@@ -12,6 +13,8 @@ import threading
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
+
+from sage_bot.db.runtime_role import ROLE_CHECK_MARKER
 
 SSL_REQUEST = 80877103
 GSS_REQUEST = 80877104
@@ -51,6 +54,7 @@ class FakePostgres:
     def __init__(self) -> None:
         self.stall = True
         self.revision = "0001"
+        self.role_problems = ""
         self.cancel_requests = 0
         self._open = 0
         self._lock = threading.Lock()
@@ -124,12 +128,17 @@ class FakePostgres:
             return True
 
     def _session(self, connection: socket.socket) -> None:
+        query = b""
         while True:
             kind = _read_exact(connection, 1)
             (length,) = struct.unpack("!I", _read_exact(connection, 4))
-            _read_exact(connection, length - 4)
+            body = _read_exact(connection, length - 4)
             if kind == b"X":  # Terminate
                 return
+            if kind == b"P":  # Parse: statement name, then the query text
+                query = body.split(b"\0")[1]
+            elif kind == b"Q":
+                query = body.split(b"\0")[0]
             if self.stall:
                 continue  # accept the query, never answer it
             if kind == b"P":
@@ -139,19 +148,20 @@ class FakePostgres:
             elif kind == b"D":
                 connection.sendall(_ROW_DESCRIPTION)
             elif kind == b"E":
-                connection.sendall(self._row() + _message(b"C", b"SELECT 1\0"))
+                connection.sendall(self._row(query) + _message(b"C", b"SELECT 1\0"))
             elif kind == b"S":
                 connection.sendall(_message(b"Z", b"I"))
             elif kind == b"Q":
                 connection.sendall(
                     _ROW_DESCRIPTION
-                    + self._row()
+                    + self._row(query)
                     + _message(b"C", b"SELECT 1\0")
                     + _message(b"Z", b"I")
                 )
 
-    def _row(self) -> bytes:
-        value = self.revision.encode()
+    def _row(self, query: bytes) -> bytes:
+        answer = self.role_problems if ROLE_CHECK_MARKER.encode() in query else self.revision
+        value = answer.encode()
         return _message(b"D", struct.pack("!HI", 1, len(value)) + value)  # DataRow
 
     def start(self) -> None:

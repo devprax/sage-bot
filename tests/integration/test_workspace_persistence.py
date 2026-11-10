@@ -7,14 +7,13 @@ conftest.py.
 
 import asyncio
 import time
-from collections.abc import Iterator
 from typing import Any, LiteralString
 from uuid import UUID, uuid4
 
 import psycopg
 import pytest
 from alembic import command
-from pg_support import TenantDatabase
+from pg_support import TenantDatabase, grant_runtime_access
 from psycopg import errors, sql
 
 from sage_bot.api.readiness import postgres_check
@@ -27,19 +26,6 @@ from sage_bot.db.workspaces import (
 from sage_bot.workspaces import Registration, Workspace, WorkspaceStatus
 
 TEAM_A, TEAM_B = "TALPHA0001", "TBRAVO0002"
-
-
-@pytest.fixture
-def migrated(tenant_database: TenantDatabase) -> Iterator[TenantDatabase]:
-    """The tenant database migrated to head by its owner, with the documented runtime grant."""
-    migrate.upgrade(tenant_database.owner_url)
-    with psycopg.connect(tenant_database.owner_url, autocommit=True) as owner:
-        owner.execute(
-            sql.SQL("GRANT SELECT ON slack_workspaces TO {}").format(
-                sql.Identifier(tenant_database.runtime_role)
-            )
-        )
-    yield tenant_database
 
 
 def _register(url: str, team: str) -> tuple[Workspace, bool]:
@@ -63,9 +49,10 @@ def _rows(url: str) -> list[tuple[Any, ...]]:
 
 
 def test_fresh_migration_reaches_head_and_is_ready(tenant_database: TenantDatabase) -> None:
-    assert _ready(tenant_database.owner_url) is False
+    assert _ready(tenant_database.runtime_url) is False
     migrate.upgrade(tenant_database.owner_url)
-    assert _ready(tenant_database.owner_url) is True
+    grant_runtime_access(tenant_database.owner_url, tenant_database.runtime_role)
+    assert _ready(tenant_database.runtime_url) is True
     assert _rows(tenant_database.owner_url) == []
 
 
@@ -74,16 +61,23 @@ def test_upgrade_from_the_baseline_and_readiness_around_it(
 ) -> None:
     config = migrate.alembic_config(tenant_database.owner_url)
     command.upgrade(config, "0001")
+    with psycopg.connect(tenant_database.owner_url, autocommit=True) as owner:
+        owner.execute(
+            sql.SQL("GRANT SELECT ON alembic_version TO {}").format(
+                sql.Identifier(tenant_database.runtime_role)
+            )
+        )
     # At the merged baseline the database is behind this release, so it is not ready.
-    assert _ready(tenant_database.owner_url) is False
+    assert _ready(tenant_database.runtime_url) is False
     migrate.upgrade(tenant_database.owner_url)
-    assert _ready(tenant_database.owner_url) is True
+    grant_runtime_access(tenant_database.owner_url, tenant_database.runtime_role)
+    assert _ready(tenant_database.runtime_url) is True
     workspace, created = _register(tenant_database.owner_url, TEAM_A)
     assert created is True
     assert workspace.status is WorkspaceStatus.DISABLED
     # Downgrading back to the baseline removes the table and readiness follows.
     command.downgrade(config, "0001")
-    assert _ready(tenant_database.owner_url) is False
+    assert _ready(tenant_database.runtime_url) is False
     with psycopg.connect(tenant_database.owner_url) as connection:
         assert connection.execute("SELECT to_regclass('slack_workspaces')").fetchone() == (None,)
 
