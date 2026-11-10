@@ -59,7 +59,8 @@ Readiness verifies the runtime role on every probe, from its effective privilege
 - holds any grant beyond an allow-list. The allow-list is `SELECT` on `alembic_version` and `slack_workspaces`, `USAGE` on the application schema, and `CONNECT` or `TEMPORARY` on databases. Grants checked include those on tables, columns, functions, schemas, databases, types, languages, foreign servers, large objects and tablespaces, plus default privileges for future objects and user mappings. On PostgreSQL 17, `MAINTAIN` counts too;
 - can create objects in those schemas or in the database;
 - benefits from anything the deployment granted to `PUBLIC` beyond what each object starts with. That baseline is the initial privileges PostgreSQL or an extension recorded, or else PostgreSQL's default for that kind of object. Examples include `EXECUTE` on `pg_read_binary_file` or `dblink_connect_u`, `SELECT` on `pg_statistic`, `USAGE` on a foreign server, a user mapping for `PUBLIC`, or (PostgreSQL 15 and later) a grant on a server parameter. Grants to other roles that merely spell out `PUBLIC`'s defaults are not flagged. `USAGE` on a schema other than the application schema, for example an `extensions` schema, also counts, when granted to the role or, beyond the schema's initial privileges, to `PUBLIC`;
-- cannot read `slack_workspaces`, or that table has row-level security disabled.
+- cannot read `slack_workspaces`, or that table has row-level security disabled;
+- connects with `row_security` off, whether set in the options of `DATABASE_URL` or as a role or database default. This does not bypass the policy for a restricted role; it makes every tenant query on the table fail. Readiness checks the setting as the session has it and does not override it.
 
 Before PostgreSQL 15, `PUBLIC` can create objects in `public` by default, so readiness reports `503` until the deployment runs `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
 

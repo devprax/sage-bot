@@ -23,10 +23,12 @@ from psycopg import sql
 from sage_bot.api.app import create_app
 from sage_bot.api.readiness import not_configured, postgres_check, readiness_from_environment
 from sage_bot.db import migrate
+from sage_bot.db.workspaces import PostgresTenantWorkspaces, PostgresWorkspaceProvisioning
 
 ENCRYPTION_KEY = base64.b64encode(bytes(range(32))).decode()
 WRONG_PASSWORD = "wrong-password-for-test"  # noqa: S105
 UNSAFE = "readiness: runtime database role is unsafe"
+TEAM = "TROWSEC0001"
 
 
 def _ready(url: str) -> bool:
@@ -633,6 +635,76 @@ def test_options_in_the_runtime_url_are_honoured(
     assert "owns_schema" in caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
     for secret in _secrets(migrated.runtime_url):
         assert secret not in caplog.text
+
+
+def _row_security_off_by_url(db: TenantDatabase) -> str:
+    return f"{db.runtime_url}?options=-crow_security%3Doff"
+
+
+def _row_security_off_by_role_default(db: TenantDatabase) -> str:
+    _admin(db, "ALTER ROLE {rt} SET row_security = off", rt=db.runtime_role)
+    return db.runtime_url
+
+
+def _row_security_off_by_role_in_database_default(db: TenantDatabase) -> str:
+    database = urlsplit(db.runtime_url).path.lstrip("/")
+    _admin(
+        db,
+        "ALTER ROLE {rt} IN DATABASE {db} SET row_security = off",
+        rt=db.runtime_role,
+        db=database,
+    )
+    return db.runtime_url
+
+
+ROW_SECURITY_OFF: dict[str, Callable[[TenantDatabase], str]] = {
+    "url options": _row_security_off_by_url,
+    "role default": _row_security_off_by_role_default,
+    "role default in the database": _row_security_off_by_role_in_database_default,
+}
+
+
+@pytest.mark.parametrize("source", list(ROW_SECURITY_OFF))
+def test_row_security_off_is_not_ready(
+    migrated: TenantDatabase,
+    source: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With row_security off, a restricted role's tenant reads fail rather than bypass the
+    policy, so the service cannot do work. Readiness checks the session's effective setting,
+    from the same URL options and role defaults the application gets."""
+    workspace = asyncio.run(
+        PostgresWorkspaceProvisioning(migrated.owner_url).register(TEAM)
+    ).workspace
+    url = ROW_SECURITY_OFF[source](migrated)
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        asyncio.run(PostgresTenantWorkspaces(url).get(workspace.id))
+    with caplog.at_level(logging.WARNING):
+        assert _ready(url) is False
+    assert "row_security_off" in caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
+    monkeypatch.setenv("SAGE_ENCRYPTION_KEY", ENCRYPTION_KEY)
+    monkeypatch.setenv("DATABASE_URL", url)
+    client = TestClient(create_app(readiness=readiness_from_environment()))
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.content == b'{"status":"not_ready"}'
+    assert client.get("/health/live").status_code == 200
+    for secret in _secrets(migrated.runtime_url, migrated.owner_url):
+        assert secret not in caplog.text
+
+
+def test_row_security_on_in_the_runtime_url_is_ready(
+    migrated: TenantDatabase, caplog: pytest.LogCaptureFixture
+) -> None:
+    workspace = asyncio.run(
+        PostgresWorkspaceProvisioning(migrated.owner_url).register(TEAM)
+    ).workspace
+    url = f"{migrated.runtime_url}?options=-crow_security%3Don"
+    assert asyncio.run(PostgresTenantWorkspaces(url).get(workspace.id)) == workspace
+    with caplog.at_level(logging.WARNING):
+        assert _ready(url) is True
+    assert caplog.text == ""
 
 
 @pytest.mark.parametrize("credentials", ["owner", "superuser"])

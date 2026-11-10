@@ -7,6 +7,7 @@ check evaluates the connected role's effective privileges, never its name:
   belongs to, whether it inherits their privileges or can `SET ROLE` to them.
 - Schema and table privileges are read from the catalog, including grants to `PUBLIC`, rather
   than assumed from PostgreSQL's defaults.
+- The session's effective `row_security` setting must be on, or tenant-scoped reads fail.
 
 It returns fixed problem codes, never names or values, so they are safe to log.
 """
@@ -66,6 +67,10 @@ PROBLEMS = (
     # It could not perform tenant-scoped workspace reads.
     "cannot_read_workspaces",
     "workspaces_without_row_security",
+    # The session's effective row_security setting (from connection options, or a role or
+    # database default) is off. For a role subject to policies this does not bypass them:
+    # every query on a policy-protected table fails, so tenant-scoped reads cannot work.
+    "row_security_off",
 )
 
 # Roles count by membership, of the login (session) role or the current role, whether they
@@ -288,7 +293,9 @@ SELECT pg_catalog.concat_ws(',',
         IS NOT TRUE THEN 'cannot_read_workspaces' END,
     CASE WHEN (
         SELECT c.relrowsecurity FROM pg_catalog.pg_class c, tables WHERE c.oid = tables.workspaces
-    ) IS NOT TRUE THEN 'workspaces_without_row_security' END
+    ) IS NOT TRUE THEN 'workspaces_without_row_security' END,
+    CASE WHEN pg_catalog.current_setting('row_security') IS DISTINCT FROM 'on'
+        THEN 'row_security_off' END
 )"""
 
 
