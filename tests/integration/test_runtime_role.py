@@ -466,6 +466,96 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         lambda db: _admin(db, "ALTER TABLE slack_workspaces DISABLE ROW LEVEL SECURITY"),
         "workspaces_without_row_security",
     ),
+    # The resolver: only EXECUTE on resolve_slack_workspace(text) in the application schema.
+    "executes a resolver with another signature": (
+        lambda db: _admin(
+            db,
+            "CREATE FUNCTION public.resolve_slack_workspace(varchar) RETURNS uuid "
+            "LANGUAGE sql AS 'SELECT NULL::uuid'; "
+            "GRANT EXECUTE ON FUNCTION public.resolve_slack_workspace(varchar) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "executes a resolver in another schema": (
+        lambda db: _admin(
+            db,
+            "CREATE SCHEMA other; "
+            "CREATE FUNCTION other.resolve_slack_workspace(text) RETURNS uuid "
+            "LANGUAGE sql AS 'SELECT NULL::uuid'; "
+            "GRANT EXECUTE ON FUNCTION other.resolve_slack_workspace(text) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "executes another security definer function": (
+        lambda db: _admin(
+            db,
+            "CREATE FUNCTION public.resolve_anything(text) RETURNS uuid "
+            "LANGUAGE sql SECURITY DEFINER AS 'SELECT NULL::uuid'; "
+            "REVOKE ALL ON FUNCTION public.resolve_anything(text) FROM PUBLIC; "
+            "GRANT EXECUTE ON FUNCTION public.resolve_anything(text) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "everyone executes the resolver": (
+        lambda db: _admin(db, "GRANT EXECUTE ON FUNCTION resolve_slack_workspace(text) TO PUBLIC"),
+        "public_executes_resolver",
+    ),
+    "resolver with the default ACL": (
+        lambda db: _admin(
+            db,
+            "UPDATE pg_proc SET proacl = NULL WHERE oid = 'resolve_slack_workspace(text)'::regprocedure",
+        ),
+        "public_executes_resolver",
+    ),
+    "cannot execute the resolver": (
+        lambda db: _admin(
+            db,
+            "REVOKE EXECUTE ON FUNCTION resolve_slack_workspace(text) FROM {rt}",
+            rt=db.runtime_role,
+        ),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver missing": (
+        lambda db: _admin(db, "DROP FUNCTION resolve_slack_workspace(text)"),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver runs as its caller": (
+        lambda db: _admin(db, "ALTER FUNCTION resolve_slack_workspace(text) SECURITY INVOKER"),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver with grant option": (
+        lambda db: _admin(
+            db,
+            "GRANT EXECUTE ON FUNCTION resolve_slack_workspace(text) TO {rt} WITH GRANT OPTION",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "reads workspaces with grant option": (
+        lambda db: _admin(
+            db, "GRANT SELECT ON slack_workspaces TO {rt} WITH GRANT OPTION", rt=db.runtime_role
+        ),
+        "unexpected_privilege",
+    ),
+    "workspaces force row security": (
+        lambda db: _admin(db, "ALTER TABLE slack_workspaces FORCE ROW LEVEL SECURITY"),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver made ambiguous by an overload": (
+        lambda db: _admin(
+            db,
+            "CREATE FUNCTION public.resolve_slack_workspace(text, int DEFAULT 0) RETURNS uuid "
+            "LANGUAGE sql AS 'SELECT NULL::uuid'",
+        ),
+        "resolver_shadowed",
+    ),
+    "resolver owned by another role": (
+        lambda db: _admin(db, "ALTER FUNCTION resolve_slack_workspace(text) OWNER TO CURRENT_USER"),
+        "cannot_resolve_workspaces",
+    ),
 }
 
 
@@ -598,6 +688,50 @@ def test_a_default_set_role_does_not_hide_the_login_roles_memberships(
         _admin(migrated, "ALTER ROLE {rt} RESET role", rt=migrated.runtime_role)
         _admin(migrated, "DROP OWNED BY {role}", role=weaker)
         _admin(migrated, "DROP ROLE {role}", role=weaker)
+
+
+_PLANTED_OPERATORS: tuple[tuple[str, str, str], ...] = (
+    ("=", "oid", "regtype"),
+    ("=", "oid", "regclass"),
+    ("=", "oid", "regnamespace"),
+    ("=", "regclass", "regclass"),
+    ("=", "oid", "int4"),
+    ("<>", "oid", "int4"),
+)
+
+
+def _plant_operators(database: TenantDatabase) -> None:
+    """Operators in public whose exact argument types beat the built-in ones, which need a
+    coercion, even with pg_catalog searched first. They answer false."""
+    for number, (operator, left, right) in enumerate(_PLANTED_OPERATORS):
+        function = f"public.planted_{number}"
+        statement = (
+            f"CREATE FUNCTION {function}({left}, {right}) RETURNS boolean "
+            "LANGUAGE sql IMMUTABLE AS 'SELECT false'; "
+            f"CREATE OPERATOR public.{operator} "
+            f"(LEFTARG = {left}, RIGHTARG = {right}, FUNCTION = {function})"
+        )
+        with psycopg.connect(database.admin_url, autocommit=True) as admin:
+            admin.execute(statement.encode())
+
+
+def test_operators_planted_on_the_search_path_do_not_change_the_result(
+    migrated: TenantDatabase, caplog: pytest.LogCaptureFixture
+) -> None:
+    _plant_operators(migrated)
+    with caplog.at_level(logging.WARNING):
+        assert _ready(migrated.runtime_url) is True
+    assert caplog.text == ""
+    _admin(migrated, "GRANT EXECUTE ON FUNCTION resolve_slack_workspace(text) TO PUBLIC")
+    _admin(migrated, "GRANT SELECT ON pg_catalog.pg_statistic TO PUBLIC")
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert _ready(migrated.runtime_url) is False
+        codes = caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
+        assert "public_executes_resolver" in codes
+        assert "public_privilege" in codes
+    finally:
+        _admin(migrated, "REVOKE SELECT ON pg_catalog.pg_statistic FROM PUBLIC")
 
 
 @pytest.mark.parametrize(

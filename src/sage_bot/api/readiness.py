@@ -19,6 +19,7 @@ import psycopg
 from pydantic import ValidationError
 
 from sage_bot.config.settings import Settings
+from sage_bot.db.connections import discard
 from sage_bot.db.migrate import expected_revision
 from sage_bot.db.runtime_role import (
     PARAMETER_CHECK,
@@ -31,10 +32,6 @@ logger = logging.getLogger(__name__)
 
 # Identifies probe connections in pg_stat_activity.
 APPLICATION_NAME = "sage-bot-readiness"
-# Bound for releasing a probe after its deadline. Closing is local, and psycopg ends the query
-# at its next poll (tens of milliseconds). Only if it did not would a response exceed the
-# deadline, by at most 2 * CLEANUP_SECONDS.
-CLEANUP_SECONDS = 1.0
 
 type ReadinessCheck = Callable[[], Coroutine[Any, Any, bool]]
 
@@ -87,7 +84,7 @@ def postgres_check(
             logger.warning("readiness: database check failed (%s)", type(error).__name__)
             return False
         finally:
-            await _discard(connection, query)
+            await discard(connection, query)
         if revisions != [(expected_revision,)]:
             logger.warning("readiness: database schema is not at the expected revision")
             return False
@@ -134,26 +131,6 @@ async def _inspect(
         results.append(row[0] if row is not None else None)
     problems = [code for result in results for code in parse_problems(result)]
     return revisions, list(dict.fromkeys(problems))
-
-
-async def _discard(
-    connection: psycopg.AsyncConnection[Any] | None, query: asyncio.Task[Any] | None
-) -> None:
-    """Release a probe's connection and query without waiting on the server."""
-    if connection is not None:
-        # libpq's PQfinish: closes the socket locally and does not wait for the server.
-        await connection.close()
-    if query is None:
-        return
-    if not query.done():
-        # With its socket closed, the query fails at psycopg's next poll; bound the wait.
-        await asyncio.wait({query}, timeout=CLEANUP_SECONDS)
-    if not query.done():
-        # Last resort. The connection is closed, so psycopg sends no cancel request.
-        query.cancel()
-        await asyncio.wait({query}, timeout=CLEANUP_SECONDS)
-    if query.done() and not query.cancelled():
-        query.exception()  # retrieved, so asyncio does not report it as unhandled
 
 
 def readiness_from_environment() -> ReadinessCheck:

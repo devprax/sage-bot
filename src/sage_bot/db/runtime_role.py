@@ -21,6 +21,10 @@ PROBLEMS = (
     # The session switched to another role (for example a role's default `SET ROLE`), so the
     # privileges in effect are not those of the login role it can switch back to.
     "session_role_differs",
+    # pg_catalog is listed explicitly on the search path after another schema, so objects
+    # there could stand in for built-in types, operators and functions, in this check and in
+    # the application's queries. Unlisted, pg_catalog is searched first.
+    "search_path_overrides_catalog",
     # A role it belongs to can bypass row-level security or every permission check.
     "superuser",
     "bypassrls",
@@ -39,9 +43,10 @@ PROBLEMS = (
     # implicit rather than recorded as grants, so none is accepted.
     "predefined_role",
     # It, or a role it belongs to, holds a grant beyond the runtime allow-list: SELECT on
-    # alembic_version and slack_workspaces, USAGE on the application schema, and CONNECT or
-    # TEMPORARY on databases. This covers every object kind with grants, column grants, default
-    # privileges for future objects, and user mappings.
+    # alembic_version and slack_workspaces, EXECUTE on resolve_slack_workspace(text), USAGE on
+    # the application schema, and CONNECT or TEMPORARY on databases, none with grant option.
+    # This covers every object kind with grants, column grants, default privileges for future
+    # objects, and user mappings.
     "unexpected_privilege",
     # The deployment granted PUBLIC more than an object starts with: initdb's or an
     # extension's initial privileges, or else PostgreSQL's default for the object kind. Every
@@ -71,6 +76,18 @@ PROBLEMS = (
     # database default) is off. For a role subject to policies this does not bypass them:
     # every query on a policy-protected table fails, so tenant-scoped reads cannot work.
     "row_security_off",
+    # It could not resolve Slack teams: resolve_slack_workspace(text) is missing from the
+    # application schema, it may not execute it, the function is not a SECURITY DEFINER
+    # function owned by the workspace table's owner (the only owner it can read rows as), or
+    # the table forces row-level security on that owner.
+    "cannot_resolve_workspaces",
+    # The application's unqualified call might not reach that function: another function of
+    # that name (an overload, or one in another schema) on this session's search path could
+    # substitute for it or make the call ambiguous.
+    "resolver_shadowed",
+    # PUBLIC may execute resolve_slack_workspace(text), so every role could resolve teams.
+    # PostgreSQL's default for functions includes this, so the PUBLIC baseline does not catch it.
+    "public_executes_resolver",
 )
 
 # Roles count by membership, of the login (session) role or the current role, whether they
@@ -90,7 +107,7 @@ WITH held AS (
 app AS (
     SELECT c.relnamespace AS schema_oid
     FROM pg_catalog.pg_class c
-    WHERE c.oid = pg_catalog.to_regclass('alembic_version')
+    WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('alembic_version')
 ),
 schemas AS (
     SELECT n.oid AS schema_oid, n.nspowner
@@ -104,6 +121,11 @@ tables AS (
          WHERE c.relname = 'alembic_version') AS revision,
         (SELECT c.oid FROM pg_catalog.pg_class c JOIN app ON c.relnamespace = app.schema_oid
          WHERE c.relname = 'slack_workspaces') AS workspaces,
+        -- Identified by schema, name and argument types, never by name alone.
+        (SELECT p.oid FROM pg_catalog.pg_proc p JOIN app ON p.pronamespace = app.schema_oid
+         WHERE p.proname = 'resolve_slack_workspace' AND p.prokind = 'f'
+           AND p.pronargs = 1
+           AND p.proargtypes[0] OPERATOR(pg_catalog.=) 'pg_catalog.text'::pg_catalog.regtype) AS resolver,
         pg_catalog.current_setting('server_version_num')::int >= 170000 AS has_maintain
 ),
 acl_objects AS (
@@ -166,15 +188,19 @@ grants AS (
     -- Grants to the runtime role, a role it belongs to, or PUBLIC (grantee 0).
     SELECT o.catalog, o.object, o.subobject, o.kind, o.owner, a.grantee, a.privilege_type,
         -- The runtime allow-list, for held roles only. Never NULL, nor is NOT allowed.
-        COALESCE(
-            (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
+        -- A grant option would let the runtime pass the privilege to roles of its choosing.
+        NOT a.is_grantable AND COALESCE(
+            (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
                 AND a.privilege_type = 'SELECT'
                 AND (o.object IS NOT DISTINCT FROM tables.revision
                      OR o.object IS NOT DISTINCT FROM tables.workspaces))
-            OR (o.catalog = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+            OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
+                AND a.privilege_type = 'EXECUTE'
+                AND o.object IS NOT DISTINCT FROM tables.resolver)
+            OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass
                 AND a.privilege_type = 'USAGE'
                 AND o.object IN (SELECT schema_oid FROM app))
-            OR (o.catalog = 'pg_catalog.pg_database'::pg_catalog.regclass
+            OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_database'::pg_catalog.regclass
                 AND a.privilege_type IN ('CONNECT', 'TEMPORARY')),
             false
         ) AS allowed,
@@ -183,35 +209,35 @@ grants AS (
         -- grants USAGE on information_schema and SELECT on its views to PUBLIC without
         -- recording initial privileges; those views show only what the caller may already
         -- see. Its internal _pg_ relations (user mapping options among them) are not granted.
-        COALESCE((o.catalog = 'pg_catalog.pg_namespace'::pg_catalog.regclass
-            AND o.object = 'information_schema'::pg_catalog.regnamespace
+        COALESCE((o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass
+            AND o.object OPERATOR(pg_catalog.=) 'information_schema'::pg_catalog.regnamespace
             AND a.privilege_type = 'USAGE')
-        OR (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
-            AND o.schema = 'information_schema'::pg_catalog.regnamespace
+        OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
+            AND o.schema OPERATOR(pg_catalog.=) 'information_schema'::pg_catalog.regnamespace
             AND a.privilege_type = 'SELECT'
             AND NOT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_class c
                 WHERE c.oid = o.object AND pg_catalog.starts_with(c.relname, '_pg_')
             ))
-        OR CASE WHEN o.catalog = 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+        OR CASE WHEN o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_default_acl'::pg_catalog.regclass
                   OR NOT EXISTS (
                       SELECT 1 FROM pg_catalog.pg_init_privs i
-                      WHERE i.classoid = o.catalog AND i.objoid = o.object
+                      WHERE i.classoid OPERATOR(pg_catalog.=) o.catalog AND i.objoid = o.object
                         AND i.objsubid = o.subobject
                   )
             THEN EXISTS (
                 SELECT 1 FROM pg_catalog.aclexplode(pg_catalog.acldefault(o.kind, o.owner)) d
-                WHERE d.grantee = 0 AND d.privilege_type = a.privilege_type
+                WHERE d.grantee OPERATOR(pg_catalog.=) 0 AND d.privilege_type = a.privilege_type
             )
             ELSE EXISTS (
                 SELECT 1 FROM pg_catalog.pg_init_privs i, pg_catalog.aclexplode(i.initprivs) d
-                WHERE i.classoid = o.catalog AND i.objoid = o.object
+                WHERE i.classoid OPERATOR(pg_catalog.=) o.catalog AND i.objoid = o.object
                   AND i.objsubid = o.subobject
-                  AND d.grantee = 0 AND d.privilege_type = a.privilege_type
+                  AND d.grantee OPERATOR(pg_catalog.=) 0 AND d.privilege_type = a.privilege_type
             )
         END, false) AS initial
     FROM acl_objects o, tables, pg_catalog.aclexplode(o.acl) a
-    WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM held)
+    WHERE a.grantee OPERATOR(pg_catalog.=) 0 OR a.grantee IN (SELECT oid FROM held)
 ),
 writes AS (
     SELECT
@@ -236,6 +262,10 @@ writes AS (
     FROM tables
 )
 SELECT pg_catalog.concat_ws(',',
+    -- Qualified throughout: it guards the rest of this query.
+    CASE WHEN pg_catalog.array_position(
+        pg_catalog.current_schemas(false), 'pg_catalog'::pg_catalog.name
+    ) OPERATOR(pg_catalog.>) 1 THEN 'search_path_overrides_catalog' END,
     CASE WHEN current_user <> session_user THEN 'session_role_differs' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolsuper) THEN 'superuser' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolbypassrls) THEN 'bypassrls' END,
@@ -252,13 +282,13 @@ SELECT pg_catalog.concat_ws(',',
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE pg_catalog.starts_with(rolname, 'pg_'))
         THEN 'predefined_role' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM grants WHERE grantee <> 0 AND NOT allowed
+        SELECT 1 FROM grants WHERE grantee OPERATOR(pg_catalog.<>) 0 AND NOT allowed
     ) THEN 'unexpected_privilege' END,
     CASE WHEN EXISTS (
         -- The runtime allow-list does not extend to PUBLIC: every role would hold it.
-        SELECT 1 FROM grants WHERE grantee = 0 AND NOT initial
+        SELECT 1 FROM grants WHERE grantee OPERATOR(pg_catalog.=) 0 AND NOT initial
     ) OR EXISTS (
-        SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser = 0
+        SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser OPERATOR(pg_catalog.=) 0
     ) THEN 'public_privilege' END,
     CASE WHEN EXISTS (
         SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser IN (SELECT oid FROM held)
@@ -295,7 +325,31 @@ SELECT pg_catalog.concat_ws(',',
         SELECT c.relrowsecurity FROM pg_catalog.pg_class c, tables WHERE c.oid = tables.workspaces
     ) IS NOT TRUE THEN 'workspaces_without_row_security' END,
     CASE WHEN pg_catalog.current_setting('row_security') IS DISTINCT FROM 'on'
-        THEN 'row_security_off' END
+        THEN 'row_security_off' END,
+    CASE WHEN NOT COALESCE((
+        SELECT pg_catalog.has_function_privilege(p.oid, 'EXECUTE')
+            AND p.prosecdef AND p.proowner = c.relowner AND NOT c.relforcerowsecurity
+        FROM tables
+        JOIN pg_catalog.pg_proc p ON p.oid = tables.resolver
+        JOIN pg_catalog.pg_class c ON c.oid = tables.workspaces
+    ), false) THEN 'cannot_resolve_workspaces' END,
+    -- The application schema is on the path (alembic_version is found through it), so the
+    -- call reaches the checked function unless another function of that name is on the path.
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc p, tables
+        WHERE p.proname = 'resolve_slack_workspace' AND p.oid <> tables.resolver
+          AND p.pronamespace IN (
+              SELECT n.oid FROM pg_catalog.pg_namespace n
+              WHERE n.nspname = ANY (pg_catalog.current_schemas(true))
+          )
+    ) THEN 'resolver_shadowed' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM tables JOIN pg_catalog.pg_proc p ON p.oid = tables.resolver
+        WHERE p.proacl IS NULL OR EXISTS (
+            SELECT 1 FROM pg_catalog.aclexplode(p.proacl) a
+            WHERE a.grantee OPERATOR(pg_catalog.=) 0 AND a.privilege_type = 'EXECUTE'
+        )
+    ) THEN 'public_executes_resolver' END
 )"""
 
 
@@ -311,7 +365,7 @@ WITH held AS (
 SELECT CASE WHEN EXISTS (
     SELECT 1
     FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) a
-    WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM held)
+    WHERE a.grantee OPERATOR(pg_catalog.=) 0 OR a.grantee IN (SELECT oid FROM held)
 ) THEN 'parameter_grant' ELSE '' END"""
 PARAMETER_CHECK_MIN_SERVER_VERSION = 150000
 
