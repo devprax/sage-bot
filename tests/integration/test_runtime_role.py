@@ -466,6 +466,70 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         lambda db: _admin(db, "ALTER TABLE slack_workspaces DISABLE ROW LEVEL SECURITY"),
         "workspaces_without_row_security",
     ),
+    # The resolver: only EXECUTE on resolve_slack_workspace(text) in the application schema.
+    "executes a resolver with another signature": (
+        lambda db: _admin(
+            db,
+            "CREATE FUNCTION public.resolve_slack_workspace(varchar) RETURNS uuid "
+            "LANGUAGE sql AS 'SELECT NULL::uuid'; "
+            "GRANT EXECUTE ON FUNCTION public.resolve_slack_workspace(varchar) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "executes a resolver in another schema": (
+        lambda db: _admin(
+            db,
+            "CREATE SCHEMA other; "
+            "CREATE FUNCTION other.resolve_slack_workspace(text) RETURNS uuid "
+            "LANGUAGE sql AS 'SELECT NULL::uuid'; "
+            "GRANT EXECUTE ON FUNCTION other.resolve_slack_workspace(text) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "executes another security definer function": (
+        lambda db: _admin(
+            db,
+            "CREATE FUNCTION public.resolve_anything(text) RETURNS uuid "
+            "LANGUAGE sql SECURITY DEFINER AS 'SELECT NULL::uuid'; "
+            "REVOKE ALL ON FUNCTION public.resolve_anything(text) FROM PUBLIC; "
+            "GRANT EXECUTE ON FUNCTION public.resolve_anything(text) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "everyone executes the resolver": (
+        lambda db: _admin(db, "GRANT EXECUTE ON FUNCTION resolve_slack_workspace(text) TO PUBLIC"),
+        "public_executes_resolver",
+    ),
+    "resolver with the default ACL": (
+        lambda db: _admin(
+            db,
+            "UPDATE pg_proc SET proacl = NULL WHERE oid = 'resolve_slack_workspace(text)'::regprocedure",
+        ),
+        "public_executes_resolver",
+    ),
+    "cannot execute the resolver": (
+        lambda db: _admin(
+            db,
+            "REVOKE EXECUTE ON FUNCTION resolve_slack_workspace(text) FROM {rt}",
+            rt=db.runtime_role,
+        ),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver missing": (
+        lambda db: _admin(db, "DROP FUNCTION resolve_slack_workspace(text)"),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver runs as its caller": (
+        lambda db: _admin(db, "ALTER FUNCTION resolve_slack_workspace(text) SECURITY INVOKER"),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver owned by another role": (
+        lambda db: _admin(db, "ALTER FUNCTION resolve_slack_workspace(text) OWNER TO CURRENT_USER"),
+        "cannot_resolve_workspaces",
+    ),
 }
 
 

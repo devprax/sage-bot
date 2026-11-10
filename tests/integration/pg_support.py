@@ -55,3 +55,8 @@ def grant_runtime_access(owner_url: str, runtime_role: str) -> None:
                 sql.Identifier(runtime_role)
             )
         )
+        owner.execute(
+            sql.SQL("GRANT EXECUTE ON FUNCTION resolve_slack_workspace(text) TO {}").format(
+                sql.Identifier(runtime_role)
+            )
+        )

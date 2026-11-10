@@ -39,8 +39,8 @@ PROBLEMS = (
     # implicit rather than recorded as grants, so none is accepted.
     "predefined_role",
     # It, or a role it belongs to, holds a grant beyond the runtime allow-list: SELECT on
-    # alembic_version and slack_workspaces, USAGE on the application schema, and CONNECT or
-    # TEMPORARY on databases. This covers every object kind with grants, column grants, default
+    # alembic_version and slack_workspaces, EXECUTE on resolve_slack_workspace(text), USAGE on
+    # the application schema, and CONNECT or TEMPORARY on databases. This covers every object kind with grants, column grants, default
     # privileges for future objects, and user mappings.
     "unexpected_privilege",
     # The deployment granted PUBLIC more than an object starts with: initdb's or an
@@ -71,6 +71,13 @@ PROBLEMS = (
     # database default) is off. For a role subject to policies this does not bypass them:
     # every query on a policy-protected table fails, so tenant-scoped reads cannot work.
     "row_security_off",
+    # It could not resolve Slack teams: resolve_slack_workspace(text) is missing from the
+    # application schema, it may not execute it, or the function is not a SECURITY DEFINER
+    # function owned by the workspace table's owner (the only owner it can read rows as).
+    "cannot_resolve_workspaces",
+    # PUBLIC may execute resolve_slack_workspace(text), so every role could resolve teams.
+    # PostgreSQL's default for functions includes this, so the PUBLIC baseline does not catch it.
+    "public_executes_resolver",
 )
 
 # Roles count by membership, of the login (session) role or the current role, whether they
@@ -104,6 +111,10 @@ tables AS (
          WHERE c.relname = 'alembic_version') AS revision,
         (SELECT c.oid FROM pg_catalog.pg_class c JOIN app ON c.relnamespace = app.schema_oid
          WHERE c.relname = 'slack_workspaces') AS workspaces,
+        -- Identified by schema, name and argument types, never by name alone.
+        (SELECT p.oid FROM pg_catalog.pg_proc p JOIN app ON p.pronamespace = app.schema_oid
+         WHERE p.proname = 'resolve_slack_workspace' AND p.prokind = 'f'
+           AND pg_catalog.oidvectortypes(p.proargtypes) = 'text') AS resolver,
         pg_catalog.current_setting('server_version_num')::int >= 170000 AS has_maintain
 ),
 acl_objects AS (
@@ -171,6 +182,9 @@ grants AS (
                 AND a.privilege_type = 'SELECT'
                 AND (o.object IS NOT DISTINCT FROM tables.revision
                      OR o.object IS NOT DISTINCT FROM tables.workspaces))
+            OR (o.catalog = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                AND a.privilege_type = 'EXECUTE'
+                AND o.object IS NOT DISTINCT FROM tables.resolver)
             OR (o.catalog = 'pg_catalog.pg_namespace'::pg_catalog.regclass
                 AND a.privilege_type = 'USAGE'
                 AND o.object IN (SELECT schema_oid FROM app))
@@ -295,7 +309,21 @@ SELECT pg_catalog.concat_ws(',',
         SELECT c.relrowsecurity FROM pg_catalog.pg_class c, tables WHERE c.oid = tables.workspaces
     ) IS NOT TRUE THEN 'workspaces_without_row_security' END,
     CASE WHEN pg_catalog.current_setting('row_security') IS DISTINCT FROM 'on'
-        THEN 'row_security_off' END
+        THEN 'row_security_off' END,
+    CASE WHEN NOT COALESCE((
+        SELECT pg_catalog.has_function_privilege(p.oid, 'EXECUTE')
+            AND p.prosecdef AND p.proowner = c.relowner
+        FROM tables
+        JOIN pg_catalog.pg_proc p ON p.oid = tables.resolver
+        JOIN pg_catalog.pg_class c ON c.oid = tables.workspaces
+    ), false) THEN 'cannot_resolve_workspaces' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM tables JOIN pg_catalog.pg_proc p ON p.oid = tables.resolver
+        WHERE p.proacl IS NULL OR EXISTS (
+            SELECT 1 FROM pg_catalog.aclexplode(p.proacl) a
+            WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+        )
+    ) THEN 'public_executes_resolver' END
 )"""
 
 

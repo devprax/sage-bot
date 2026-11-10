@@ -7,6 +7,8 @@ Two interfaces separate the trust levels:
   steps do. It must never be reachable from tenant request handling.
 - `TenantWorkspaces` is tenant-scoped. Each call is bound to one workspace for one transaction,
   and the database's row-level security limits it to that workspace's row.
+- `WorkspaceResolver` is the one tenant-free read the runtime needs: it maps a Slack team to its
+  workspace UUID, and only for an enabled workspace.
 """
 
 import re
@@ -60,4 +62,26 @@ class WorkspaceProvisioning(Protocol):
 class TenantWorkspaces(Protocol):
     async def get(self, workspace_id: UUID) -> Workspace | None:
         """The workspace, read within a transaction bound to that workspace."""
+        ...
+
+
+class WorkspaceLookupUnavailable(Exception):
+    """The lookup could not complete (database failure or timeout); it may succeed later.
+
+    Distinct from no match: a caller must not treat it as an unknown or disabled workspace.
+    The message names only the failure's type, never connection details.
+    """
+
+
+class WorkspaceResolver(Protocol):
+    async def resolve_enabled(self, slack_team_id: str) -> UUID | None:
+        """The UUID of the team's workspace if it is enabled; None if it is unknown or disabled.
+
+        Never registers or enables a workspace. Raises ValueError for a malformed team ID,
+        before connecting, and WorkspaceLookupUnavailable if the lookup cannot complete.
+
+        This is not authentication. The team ID must come from a request whose Slack origin was
+        already verified (signature and timestamp); a resolved workspace says only that the
+        team is enabled, not that the caller speaks for it.
+        """
         ...

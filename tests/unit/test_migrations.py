@@ -36,7 +36,7 @@ def valid_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_the_single_migration_head_is_the_expected_revision() -> None:
     heads = ScriptDirectory.from_config(migrate.alembic_config()).get_heads()
     assert heads == [migrate.expected_revision()]
-    assert migrate.expected_revision() == "0002"
+    assert migrate.expected_revision() == "0003"
 
 
 def test_migrations_ship_inside_the_package() -> None:

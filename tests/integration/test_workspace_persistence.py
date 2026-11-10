@@ -356,7 +356,8 @@ def test_runtime_role_cannot_provision_workspaces(migrated: TenantDatabase) -> N
     with pytest.raises(errors.InsufficientPrivilege):
         asyncio.run(provisioning.register(TEAM_A))
     _register(migrated.owner_url, TEAM_A)
-    # Without a tenant, the runtime role cannot resolve a team to a workspace either.
+    # Without a tenant, the runtime role cannot read a team's workspace from the table either;
+    # it resolves enabled teams only through resolve_slack_workspace.
     assert asyncio.run(provisioning.find_by_slack_team(TEAM_A)) is None
 
 
