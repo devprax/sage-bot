@@ -1,1 +1,1 @@
-"""Database schema migrations."""
+"""Database schema migrations and persistence."""
