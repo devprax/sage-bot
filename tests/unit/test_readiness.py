@@ -18,7 +18,7 @@ from sage_bot.api.readiness import (
     postgres_check,
     readiness_from_environment,
 )
-from sage_bot.db.runtime_role import ROLE_CHECK, ROLE_CHECK_MARKER
+from sage_bot.db.runtime_role import ROLE_CHECK, ROLE_CHECK_MARKER, parse_problems
 
 # Synthetic credentials only; nothing here reaches a real database.
 PASSWORD = "readiness-test-password"  # noqa: S105
@@ -165,7 +165,13 @@ class _FakeCursor:
         return self._row
 
 
+class _FakeInfo:
+    server_version = 170000
+
+
 class _FakeConnection:
+    info = _FakeInfo()
+
     async def __aenter__(self) -> "_FakeConnection":
         return self
 
@@ -371,3 +377,7 @@ def test_role_check_problems_outside_the_known_codes_are_not_logged(
 
 def test_the_role_check_query_carries_its_marker() -> None:
     assert ROLE_CHECK.startswith(f"/* {ROLE_CHECK_MARKER} */")
+
+
+def test_parameter_check_problems_are_merged_without_duplicates() -> None:
+    assert parse_problems("superuser,bypassrls,superuser") == ["superuser", "bypassrls"]

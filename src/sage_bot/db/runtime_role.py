@@ -34,6 +34,12 @@ PROBLEMS = (
     "server_files_or_programs",
     # It could terminate other sessions, including migrations.
     "signal_backend",
+    # It can run a superuser-only system function, such as reading server files, which
+    # bypasses every permission check.
+    "privileged_function",
+    # It was granted a server parameter (PostgreSQL 15+), which can load code or change how
+    # the server enforces permissions.
+    "parameter_grant",
     # An owner can disable or replace policies, alter or drop tables, or replace code that
     # other roles run. The schemas checked are the application schema and the search path.
     "owns_schema",
@@ -120,6 +126,21 @@ SELECT pg_catalog.concat_ws(',',
     ) THEN 'server_files_or_programs' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolname = 'pg_signal_backend')
         THEN 'signal_backend' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc f, held
+        WHERE f.pronamespace = 'pg_catalog'::pg_catalog.regnamespace
+          AND (
+              -- Restricted by default: PUBLIC lacks EXECUTE, so a grant is deliberate.
+              (f.proacl IS NOT NULL
+               AND NOT pg_catalog.has_function_privilege('public', f.oid, 'EXECUTE'))
+              -- Server file and large object access, even if granted to PUBLIC.
+              OR f.proname IN (
+                  'pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'pg_stat_file',
+                  'lo_import', 'lo_export'
+              )
+          )
+          AND pg_catalog.has_function_privilege(held.oid, f.oid, 'EXECUTE')
+    ) THEN 'privileged_function' END,
     CASE WHEN EXISTS (SELECT 1 FROM schemas JOIN held ON held.oid = schemas.nspowner)
         THEN 'owns_schema' END,
     CASE WHEN EXISTS (
@@ -154,9 +175,26 @@ SELECT pg_catalog.concat_ws(',',
 )"""
 
 
+# pg_parameter_acl exists from PostgreSQL 15; run this only there. Any ACL entry for a role it
+# belongs to, or for PUBLIC, counts.
+PARAMETER_CHECK: LiteralString = """/* sage-bot runtime role check: parameters */
+WITH held AS (
+    SELECT r.oid
+    FROM pg_catalog.pg_roles r
+    WHERE pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')
+       OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER')
+)
+SELECT CASE WHEN EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) a
+    WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM held)
+) THEN 'parameter_grant' ELSE '' END"""
+PARAMETER_CHECK_MIN_SERVER_VERSION = 150000
+
+
 def parse_problems(value: object) -> list[str]:
     """The problem codes in a role check result; anything unexpected becomes `unknown`."""
     if not isinstance(value, str):
         return ["unknown"]
-    codes = [code for code in value.split(",") if code]
-    return [code if code in PROBLEMS else "unknown" for code in codes]
+    codes = [code if code in PROBLEMS else "unknown" for code in value.split(",") if code]
+    return list(dict.fromkeys(codes))

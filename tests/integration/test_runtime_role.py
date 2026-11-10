@@ -261,6 +261,24 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         lambda db: _admin(db, "GRANT MAINTAIN ON alembic_version TO {rt}", rt=db.runtime_role),
         "writes_schema_revision",
     ),
+    "reads server files through a function": (
+        lambda db: _admin(
+            db,
+            "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "privileged_function",
+    ),
+    "imports server files as large objects": (
+        lambda db: _admin(
+            db, "GRANT EXECUTE ON FUNCTION pg_catalog.lo_import(text) TO {rt}", rt=db.runtime_role
+        ),
+        "privileged_function",
+    ),
+    "everyone reads server files": (
+        lambda db: _admin(db, "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC"),
+        "privileged_function",
+    ),
     "owns a function": (
         lambda db: _admin(
             db,
@@ -406,6 +424,42 @@ def test_privileges_reachable_only_through_another_role_count(
     finally:
         _admin(migrated, "DROP OWNED BY {role}", role=writer)
         _admin(migrated, "DROP ROLE {role}", role=writer)
+
+
+@pytest.mark.parametrize(
+    ("grant", "revoke"),
+    [
+        (
+            "GRANT SET ON PARAMETER session_replication_role TO {rt}",
+            "REVOKE SET ON PARAMETER session_replication_role FROM {rt}",
+        ),
+        (
+            "GRANT ALTER SYSTEM ON PARAMETER archive_command TO {rt}",
+            "REVOKE ALTER SYSTEM ON PARAMETER archive_command FROM {rt}",
+        ),
+        (
+            "GRANT SET ON PARAMETER session_replication_role TO PUBLIC",
+            "REVOKE SET ON PARAMETER session_replication_role FROM PUBLIC",
+        ),
+    ],
+    ids=["set", "alter-system", "public"],
+)
+def test_a_server_parameter_grant_is_unsafe(
+    migrated: TenantDatabase,
+    grant: LiteralString,
+    revoke: LiteralString,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Parameter grants are cluster-wide, so they are always revoked here.
+    _admin(migrated, grant, rt=migrated.runtime_role)
+    try:
+        with caplog.at_level(logging.WARNING):
+            assert _ready(migrated.runtime_url) is False
+        assert "parameter_grant" in caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
+    finally:
+        _admin(migrated, revoke, rt=migrated.runtime_role)
+    caplog.clear()
+    assert _ready(migrated.runtime_url) is True
 
 
 def test_a_default_set_role_does_not_hide_the_login_roles_memberships(

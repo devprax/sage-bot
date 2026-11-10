@@ -56,12 +56,14 @@ Readiness verifies the runtime role on every probe, from its effective privilege
 - is, or belongs to, a role with superuser, `BYPASSRLS`, `REPLICATION`, `CREATEROLE` or `CREATEDB`, or one of the predefined roles `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files` or `pg_signal_backend`. Membership counts whether it confers privileges by inheritance, by `SET ROLE` or by `ADMIN`, and the privilege checks below apply to every role it belongs to;
 - owns, or belongs to a role that owns, the application schema or a schema on its search path, or any table, function or type in them. This includes the database owner, which owns `public`;
 - can create objects in those schemas or in the database, including through grants to `PUBLIC`;
+- can run a system function that is restricted by default, such as `pg_read_binary_file` or `lo_import`, or a server file or large object function even if it was granted to `PUBLIC`;
+- holds, directly or through `PUBLIC`, a grant on a server parameter (`GRANT SET` or `GRANT ALTER SYSTEM ON PARAMETER`, PostgreSQL 15 and later);
 - holds any privilege other than `SELECT` on `alembic_version` or `slack_workspaces`, including column-level grants and, on PostgreSQL 17, `MAINTAIN`;
 - cannot read `slack_workspaces`, or that table has row-level security disabled.
 
 Before PostgreSQL 15, `PUBLIC` can create objects in `public` by default, so readiness reports `503` until the deployment runs `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
 
-The check covers the runtime role's own privileges, except grants on server parameters (`GRANT SET ON PARAMETER`), which deployments must not give it. It does not audit what the trusted owner grants or defines, such as additional row-level security policies, views or `SECURITY DEFINER` functions that expose rows, or default privileges for future tables. Functions the owner defines must revoke `EXECUTE` from `PUBLIC` unless every role may run them.
+The check covers the runtime role's own privileges. It does not audit what the trusted owner grants or defines, such as additional row-level security policies, views or `SECURITY DEFINER` functions that expose rows, or default privileges for future tables. Functions the owner defines must revoke `EXECUTE` from `PUBLIC` unless every role may run them.
 
 The problem is logged as a fixed code, such as `owns_relation`, without role names or connection values. Liveness is unaffected.
 

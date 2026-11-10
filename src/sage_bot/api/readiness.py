@@ -20,7 +20,12 @@ from pydantic import ValidationError
 
 from sage_bot.config.settings import Settings
 from sage_bot.db.migrate import expected_revision
-from sage_bot.db.runtime_role import ROLE_CHECK, parse_problems
+from sage_bot.db.runtime_role import (
+    PARAMETER_CHECK,
+    PARAMETER_CHECK_MIN_SERVER_VERSION,
+    ROLE_CHECK,
+    parse_problems,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +120,16 @@ async def _inspect(
     revisions = await cursor.fetchall()
     if revisions != [(expected_revision,)]:
         return revisions, []
-    cursor = await connection.execute(ROLE_CHECK)
-    row = await cursor.fetchone()
-    return revisions, parse_problems(row[0] if row is not None else None)
+    results: list[object] = []
+    checks = [ROLE_CHECK]
+    if connection.info.server_version >= PARAMETER_CHECK_MIN_SERVER_VERSION:
+        checks.append(PARAMETER_CHECK)
+    for check in checks:
+        cursor = await connection.execute(check)
+        row = await cursor.fetchone()
+        results.append(row[0] if row is not None else None)
+    problems = [code for result in results for code in parse_problems(result)]
+    return revisions, list(dict.fromkeys(problems))
 
 
 async def _discard(
