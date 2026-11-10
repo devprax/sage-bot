@@ -42,7 +42,8 @@ from sage_bot.workspaces import (
 TENANT_SETTING = "sage.workspace_id"
 APPLICATION_NAME = "sage-bot"
 CONNECT_TIMEOUT_SECONDS = 10
-# Slack expects an event acknowledged within three seconds; the lookup must leave room for it.
+# Default bound for one lookup. Releasing a stalled connection can add up to
+# 2 * connections.CLEANUP_SECONDS beyond it.
 RESOLVE_TIMEOUT_SECONDS = 2.0
 
 
@@ -163,7 +164,15 @@ class PostgresWorkspaceResolver:
     One deadline bounds connecting and the lookup. The query is never cancelled: psycopg answers
     cancellation with a server-side cancel request and further waiting, which the deadline would
     not bound. Past the deadline the connection is closed instead, and the session's
-    `statement_timeout`, set to the time remaining, makes the server abandon the query too.
+    `statement_timeout`, lowered to the time remaining, makes the server abandon the query too.
+    Releasing a stalled connection can add up to 2 * `CLEANUP_SECONDS` to the deadline.
+
+    `WorkspaceLookupUnavailable` covers every failure, including persistent misconfiguration
+    such as a missing EXECUTE grant (which readiness reports); its message names the error type.
+
+    The call resolves `resolve_slack_workspace(text)` through the session's search path, as the
+    application's table references do. Readiness verifies that this name resolves to the
+    function in the application schema and that no other function of that name is on the path.
     """
 
     def __init__(
@@ -180,6 +189,7 @@ class PostgresWorkspaceResolver:
         deadline = loop.time() + self._timeout_seconds
         connection: psycopg.AsyncConnection[Any] | None = None
         query: asyncio.Task[UUID | None] | None = None
+        failure: str
         try:
             async with asyncio.timeout_at(deadline):
                 connection = await _connect(
@@ -194,23 +204,30 @@ class PostgresWorkspaceResolver:
             return query.result()
         except Exception as error:
             # The type only: database errors can carry connection details.
-            raise WorkspaceLookupUnavailable(
-                f"workspace lookup failed ({type(error).__name__})"
-            ) from None
+            failure = type(error).__name__
         finally:
             await discard(connection, query)
+        # Raised outside the handler, so the original error is not kept as its context.
+        raise WorkspaceLookupUnavailable(f"workspace lookup failed ({failure})")
 
 
 async def _resolve(
     connection: psycopg.AsyncConnection[Any], team: str, remaining_seconds: float
 ) -> UUID | None:
     # A session setting rather than a connection option, which would replace any options the
-    # deployment put in DATABASE_URL.
+    # deployment put in DATABASE_URL. It only ever lowers the deployment's own limit (0 means
+    # none); pg_settings reports statement_timeout in milliseconds.
     timeout_ms = max(1, math.ceil(remaining_seconds * 1000))
     await connection.execute(
-        "SELECT pg_catalog.set_config('statement_timeout', %s, false)", (f"{timeout_ms}ms",)
+        """SELECT pg_catalog.set_config('statement_timeout', (
+               SELECT CASE WHEN s.setting::int > 0 AND s.setting::int <= %(limit)s
+                           THEN s.setting ELSE %(limit)s::text END
+               FROM pg_catalog.pg_settings s WHERE s.name = 'statement_timeout'
+           ), false)""",
+        {"limit": timeout_ms},
     )
-    cursor = await connection.execute("SELECT resolve_slack_workspace(%s)", (team,))
+    # The cast selects the text signature exactly; readiness checks what it resolves to.
+    cursor = await connection.execute("SELECT resolve_slack_workspace(%s::text)", (team,))
     row = await cursor.fetchone()
     value = None if row is None else row[0]
     if value is not None and not isinstance(value, UUID):

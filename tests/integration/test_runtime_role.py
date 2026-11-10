@@ -526,6 +526,32 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         lambda db: _admin(db, "ALTER FUNCTION resolve_slack_workspace(text) SECURITY INVOKER"),
         "cannot_resolve_workspaces",
     ),
+    "resolver with grant option": (
+        lambda db: _admin(
+            db,
+            "GRANT EXECUTE ON FUNCTION resolve_slack_workspace(text) TO {rt} WITH GRANT OPTION",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "reads workspaces with grant option": (
+        lambda db: _admin(
+            db, "GRANT SELECT ON slack_workspaces TO {rt} WITH GRANT OPTION", rt=db.runtime_role
+        ),
+        "unexpected_privilege",
+    ),
+    "workspaces force row security": (
+        lambda db: _admin(db, "ALTER TABLE slack_workspaces FORCE ROW LEVEL SECURITY"),
+        "cannot_resolve_workspaces",
+    ),
+    "resolver made ambiguous by an overload": (
+        lambda db: _admin(
+            db,
+            "CREATE FUNCTION public.resolve_slack_workspace(text, int DEFAULT 0) RETURNS uuid "
+            "LANGUAGE sql AS 'SELECT NULL::uuid'",
+        ),
+        "resolver_shadowed",
+    ),
     "resolver owned by another role": (
         lambda db: _admin(db, "ALTER FUNCTION resolve_slack_workspace(text) OWNER TO CURRENT_USER"),
         "cannot_resolve_workspaces",

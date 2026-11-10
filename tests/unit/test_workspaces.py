@@ -146,7 +146,7 @@ def test_an_unreachable_database_is_unavailable_without_details() -> None:
     assert str(failure.value) == "workspace lookup failed (OperationalError)"
     assert "unit-secret" not in str(failure.value)
     assert failure.value.__cause__ is None
-    assert failure.value.__suppress_context__ is True
+    assert failure.value.__context__ is None
 
 
 def test_the_resolution_migration_ships_inside_the_package() -> None:

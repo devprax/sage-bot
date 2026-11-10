@@ -10,6 +10,7 @@ import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any, LiteralString
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import psycopg
@@ -226,9 +227,7 @@ def test_a_caller_search_path_cannot_substitute_objects(migrated: TenantDatabase
 # Failures
 
 
-def test_invalid_input_is_rejected_before_connecting(
-    migrated: TenantDatabase, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_invalid_input_is_rejected_before_connecting(migrated: TenantDatabase) -> None:
     with pytest.raises(ValueError, match="invalid Slack team ID"):
         _resolve(migrated.runtime_url, "T' OR true --")
     assert _runtime_backends(migrated) == 0
@@ -242,7 +241,7 @@ def test_database_failures_are_unavailable_not_unknown(
         _resolve(wrong, TEAM_A)
     assert str(failure.value) == "workspace lookup failed (OperationalError)"
     assert failure.value.__cause__ is None
-    assert failure.value.__suppress_context__ is True
+    assert failure.value.__context__ is None
     for secret in ("wrong-password-for-test", wrong, migrated.runtime_url):
         assert secret not in str(failure.value)
         assert secret not in caplog.text
@@ -263,6 +262,16 @@ def test_a_stalled_lookup_times_out_and_releases_its_backend(migrated: TenantDat
         assert time.monotonic() - started < 2.0
         # The server abandons the query too, though the lock is still held.
         _wait_for_no_runtime_backends(migrated)
+
+
+def test_a_lower_deployment_statement_timeout_is_kept(migrated: TenantDatabase) -> None:
+    _register(migrated.owner_url, TEAM_A, enabled=True)
+    _admin(migrated, "ALTER ROLE {rt} SET statement_timeout = 100", rt=migrated.runtime_role)
+    with _workspaces_locked(migrated):
+        started = time.monotonic()
+        with pytest.raises(WorkspaceLookupUnavailable, match="QueryCanceled"):
+            _resolve(migrated.runtime_url, TEAM_A, timeout_seconds=5)
+        assert time.monotonic() - started < 1.5
 
 
 def test_a_cancelled_lookup_releases_its_connection(migrated: TenantDatabase) -> None:
@@ -299,6 +308,62 @@ def test_url_options_are_kept(migrated: TenantDatabase) -> None:
     url = f"{migrated.runtime_url}?options=-csearch_path%3Delsewhere"
     with pytest.raises(WorkspaceLookupUnavailable, match="UndefinedFunction"):
         _resolve(url, TEAM_A)
+
+
+def test_a_function_planted_earlier_on_the_search_path_is_reported(
+    tenant_database: TenantDatabase, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With the application schema behind another one on the runtime's search path, a role
+    that can create functions there could substitute the call. Readiness reports it."""
+    database = tenant_database
+    owner_url = f"{database.owner_url}?options=-csearch_path%3Dsage"
+    with psycopg.connect(database.owner_url, autocommit=True) as owner:
+        owner.execute("CREATE SCHEMA sage")
+    migrate.upgrade(owner_url)
+    grant_runtime_access(owner_url, database.runtime_role)
+    with psycopg.connect(owner_url, autocommit=True) as owner:
+        owner.execute(
+            sql.SQL("GRANT USAGE ON SCHEMA sage TO {}").format(
+                sql.Identifier(database.runtime_role)
+            )
+        )
+    name = urlsplit(database.runtime_url).path.lstrip("/")
+    _admin(
+        database,
+        "ALTER ROLE {rt} IN DATABASE {db} SET search_path = public, sage",
+        rt=database.runtime_role,
+        db=name,
+    )
+    enabled = _register(owner_url, TEAM_A, enabled=True)
+    assert _resolve(database.runtime_url, TEAM_A) == enabled
+    assert _ready(database.runtime_url) is True
+    _admin(
+        database,
+        """CREATE FUNCTION public.resolve_slack_workspace(text) RETURNS uuid
+           LANGUAGE sql AS $$SELECT '00000000-0000-0000-0000-0000000000ff'::uuid$$""",
+    )
+    # The substitute answers the application's call...
+    assert _resolve(database.runtime_url, TEAM_UNKNOWN) == UUID(int=0xFF)
+    # ...and readiness reports it.
+    with caplog.at_level(logging.WARNING):
+        assert _ready(database.runtime_url) is False
+    assert "resolver_shadowed" in caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
+
+
+def test_the_migration_refuses_tables_split_across_schemas(
+    tenant_database: TenantDatabase,
+) -> None:
+    command.upgrade(migrate.alembic_config(tenant_database.owner_url), "0002")
+    with psycopg.connect(tenant_database.owner_url, autocommit=True) as owner:
+        owner.execute("CREATE SCHEMA elsewhere")
+        owner.execute("CREATE TABLE elsewhere.slack_workspaces (id uuid)")
+    url = f"{tenant_database.owner_url}?options=-csearch_path%3Delsewhere,public"
+    with pytest.raises(Exception, match="not in the schema that alembic_version is in"):
+        migrate.upgrade(url)
+    with psycopg.connect(tenant_database.admin_url) as admin:
+        assert admin.execute(
+            "SELECT count(*) FROM pg_proc WHERE proname = 'resolve_slack_workspace'"
+        ).fetchone() == (0,)
 
 
 # Migration and readiness

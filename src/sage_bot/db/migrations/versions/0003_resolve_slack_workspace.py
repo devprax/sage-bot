@@ -24,10 +24,23 @@ depends_on = None
 
 
 def _schema() -> str:
-    """The schema the migrations create objects in, quoted for use in DDL."""
+    """The schema holding slack_workspaces and alembic_version, quoted for use in DDL."""
     bind = op.get_bind()
-    name = bind.execute(text("SELECT current_schema()")).scalar_one()
-    return bind.dialect.identifier_preparer.quote_schema(name)
+    schemas = bind.execute(
+        text(
+            """SELECT
+                   (SELECT n.nspname FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.oid = pg_catalog.to_regclass('slack_workspaces')),
+                   (SELECT n.nspname FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.oid = pg_catalog.to_regclass('alembic_version'))"""
+        )
+    ).one()
+    workspaces, revision = schemas
+    if workspaces is None or workspaces != revision:
+        raise RuntimeError("slack_workspaces is not in the schema that alembic_version is in")
+    return bind.dialect.identifier_preparer.quote_schema(workspaces)
 
 
 def upgrade() -> None:

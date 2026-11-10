@@ -66,10 +66,12 @@ class TenantWorkspaces(Protocol):
 
 
 class WorkspaceLookupUnavailable(Exception):
-    """The lookup could not complete (database failure or timeout); it may succeed later.
+    """The lookup could not complete: a database failure, a timeout, or misconfiguration.
 
     Distinct from no match: a caller must not treat it as an unknown or disabled workspace.
-    The message names only the failure's type, never connection details.
+    A transient failure may succeed later; misconfiguration, such as a missing grant, persists
+    until fixed, and readiness reports it. The message names only the failure's type, never
+    connection details.
     """
 
 

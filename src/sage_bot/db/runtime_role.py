@@ -40,8 +40,9 @@ PROBLEMS = (
     "predefined_role",
     # It, or a role it belongs to, holds a grant beyond the runtime allow-list: SELECT on
     # alembic_version and slack_workspaces, EXECUTE on resolve_slack_workspace(text), USAGE on
-    # the application schema, and CONNECT or TEMPORARY on databases. This covers every object kind with grants, column grants, default
-    # privileges for future objects, and user mappings.
+    # the application schema, and CONNECT or TEMPORARY on databases, none with grant option.
+    # This covers every object kind with grants, column grants, default privileges for future
+    # objects, and user mappings.
     "unexpected_privilege",
     # The deployment granted PUBLIC more than an object starts with: initdb's or an
     # extension's initial privileges, or else PostgreSQL's default for the object kind. Every
@@ -72,9 +73,14 @@ PROBLEMS = (
     # every query on a policy-protected table fails, so tenant-scoped reads cannot work.
     "row_security_off",
     # It could not resolve Slack teams: resolve_slack_workspace(text) is missing from the
-    # application schema, it may not execute it, or the function is not a SECURITY DEFINER
-    # function owned by the workspace table's owner (the only owner it can read rows as).
+    # application schema, it may not execute it, the function is not a SECURITY DEFINER
+    # function owned by the workspace table's owner (the only owner it can read rows as), or
+    # the table forces row-level security on that owner.
     "cannot_resolve_workspaces",
+    # The application's unqualified call might not reach that function: another function of
+    # that name (an overload, or one in another schema) on this session's search path could
+    # substitute for it or make the call ambiguous.
+    "resolver_shadowed",
     # PUBLIC may execute resolve_slack_workspace(text), so every role could resolve teams.
     # PostgreSQL's default for functions includes this, so the PUBLIC baseline does not catch it.
     "public_executes_resolver",
@@ -177,7 +183,8 @@ grants AS (
     -- Grants to the runtime role, a role it belongs to, or PUBLIC (grantee 0).
     SELECT o.catalog, o.object, o.subobject, o.kind, o.owner, a.grantee, a.privilege_type,
         -- The runtime allow-list, for held roles only. Never NULL, nor is NOT allowed.
-        COALESCE(
+        -- A grant option would let the runtime pass the privilege to roles of its choosing.
+        NOT a.is_grantable AND COALESCE(
             (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
                 AND a.privilege_type = 'SELECT'
                 AND (o.object IS NOT DISTINCT FROM tables.revision
@@ -312,11 +319,21 @@ SELECT pg_catalog.concat_ws(',',
         THEN 'row_security_off' END,
     CASE WHEN NOT COALESCE((
         SELECT pg_catalog.has_function_privilege(p.oid, 'EXECUTE')
-            AND p.prosecdef AND p.proowner = c.relowner
+            AND p.prosecdef AND p.proowner = c.relowner AND NOT c.relforcerowsecurity
         FROM tables
         JOIN pg_catalog.pg_proc p ON p.oid = tables.resolver
         JOIN pg_catalog.pg_class c ON c.oid = tables.workspaces
     ), false) THEN 'cannot_resolve_workspaces' END,
+    -- The application schema is on the path (alembic_version is found through it), so the
+    -- call reaches the checked function unless another function of that name is on the path.
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_catalog.pg_proc p, tables
+        WHERE p.proname = 'resolve_slack_workspace' AND p.oid <> tables.resolver
+          AND p.pronamespace IN (
+              SELECT n.oid FROM pg_catalog.pg_namespace n
+              WHERE n.nspname = ANY (pg_catalog.current_schemas(true))
+          )
+    ) THEN 'resolver_shadowed' END,
     CASE WHEN EXISTS (
         SELECT 1 FROM tables JOIN pg_catalog.pg_proc p ON p.oid = tables.resolver
         WHERE p.proacl IS NULL OR EXISTS (
