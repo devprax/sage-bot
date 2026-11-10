@@ -26,6 +26,10 @@ PROBLEMS = (
     # Before PostgreSQL 16, CREATEROLE can grant membership in any non-superuser role,
     # including the schema owner.
     "createrole",
+    # It could create databases it owns; the deployment's restricted role has no need to.
+    "createdb",
+    # Replication connections can copy the data files, bypassing every permission check.
+    "replication",
     # Server programs and files reach the database's data outside any permission check.
     "server_files_or_programs",
     # It could terminate other sessions, including migrations.
@@ -48,12 +52,15 @@ PROBLEMS = (
 )
 
 # Roles count by membership, of the login (session) role or the current role, whether they
-# confer privileges by inheritance or by `SET ROLE`. The application schema is the one holding
+# confer privileges by inheritance, by `SET ROLE` or by `ADMIN` (which can grant either).
+# Privileges are evaluated for every such role, not only for the current one, since a
+# privilege reachable through `SET ROLE` is as usable as an inherited one. The application schema is the one holding
 # `alembic_version`, and both tables are resolved in it rather than through the search path.
 # Column-level grants count as writes: has_any_column_privilege includes them.
 ROLE_CHECK: LiteralString = """/* sage-bot runtime role check */
 WITH held AS (
-    SELECT r.oid, r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole
+    SELECT r.oid, r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole, r.rolcreatedb,
+        r.rolreplication
     FROM pg_catalog.pg_roles r
     WHERE pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')
        OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER')
@@ -79,14 +86,24 @@ tables AS (
 ),
 writes AS (
     SELECT
-        pg_catalog.has_table_privilege(revision, 'DELETE, TRUNCATE, TRIGGER')
-            OR pg_catalog.has_any_column_privilege(revision, 'INSERT, UPDATE, REFERENCES')
-            OR CASE WHEN has_maintain
-                THEN pg_catalog.has_table_privilege(revision, 'MAINTAIN') END AS revision,
-        pg_catalog.has_table_privilege(workspaces, 'DELETE, TRUNCATE, TRIGGER')
-            OR pg_catalog.has_any_column_privilege(workspaces, 'INSERT, UPDATE, REFERENCES')
-            OR CASE WHEN has_maintain
-                THEN pg_catalog.has_table_privilege(workspaces, 'MAINTAIN') END AS workspaces
+        EXISTS (
+            SELECT 1 FROM held
+            WHERE pg_catalog.has_table_privilege(held.oid, revision, 'DELETE, TRUNCATE, TRIGGER')
+               OR pg_catalog.has_any_column_privilege(
+                   held.oid, revision, 'INSERT, UPDATE, REFERENCES'
+               )
+               OR CASE WHEN has_maintain
+                   THEN pg_catalog.has_table_privilege(held.oid, revision, 'MAINTAIN') END
+        ) AS revision,
+        EXISTS (
+            SELECT 1 FROM held
+            WHERE pg_catalog.has_table_privilege(held.oid, workspaces, 'DELETE, TRUNCATE, TRIGGER')
+               OR pg_catalog.has_any_column_privilege(
+                   held.oid, workspaces, 'INSERT, UPDATE, REFERENCES'
+               )
+               OR CASE WHEN has_maintain
+                   THEN pg_catalog.has_table_privilege(held.oid, workspaces, 'MAINTAIN') END
+        ) AS workspaces
     FROM tables
 )
 SELECT pg_catalog.concat_ws(',',
@@ -94,6 +111,8 @@ SELECT pg_catalog.concat_ws(',',
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolsuper) THEN 'superuser' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolbypassrls) THEN 'bypassrls' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolcreaterole) THEN 'createrole' END,
+    CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolcreatedb) THEN 'createdb' END,
+    CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolreplication) THEN 'replication' END,
     CASE WHEN EXISTS (
         SELECT 1 FROM held WHERE rolname IN (
             'pg_execute_server_program', 'pg_read_server_files', 'pg_write_server_files'
@@ -118,10 +137,13 @@ SELECT pg_catalog.concat_ws(',',
         JOIN held ON held.oid = t.typowner
     ) THEN 'owns_function_or_type' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM schemas WHERE pg_catalog.has_schema_privilege(schemas.schema_oid, 'CREATE')
+        SELECT 1 FROM held, schemas
+        WHERE pg_catalog.has_schema_privilege(held.oid, schemas.schema_oid, 'CREATE')
     ) THEN 'schema_create' END,
-    CASE WHEN pg_catalog.has_database_privilege(pg_catalog.current_database(), 'CREATE')
-        THEN 'database_create' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM held
+        WHERE pg_catalog.has_database_privilege(held.oid, pg_catalog.current_database(), 'CREATE')
+    ) THEN 'database_create' END,
     CASE WHEN (SELECT revision FROM writes) THEN 'writes_schema_revision' END,
     CASE WHEN (SELECT workspaces FROM writes) THEN 'writes_workspaces' END,
     CASE WHEN (SELECT pg_catalog.has_table_privilege(workspaces, 'SELECT') FROM tables)

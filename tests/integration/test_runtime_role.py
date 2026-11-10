@@ -200,6 +200,26 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         lambda db: _admin(db, "ALTER ROLE {rt} CREATEROLE", rt=db.runtime_role),
         "createrole",
     ),
+    "createdb": (
+        lambda db: _admin(db, "ALTER ROLE {rt} CREATEDB", rt=db.runtime_role),
+        "createdb",
+    ),
+    "replication": (
+        lambda db: _admin(db, "ALTER ROLE {rt} REPLICATION", rt=db.runtime_role),
+        "replication",
+    ),
+    "maintains every table through SET ROLE only": (
+        lambda db: _admin(
+            db, "GRANT pg_maintain TO {rt} WITH INHERIT FALSE, SET TRUE", rt=db.runtime_role
+        ),
+        "writes_workspaces",
+    ),
+    "writes all data through SET ROLE only": (
+        lambda db: _admin(
+            db, "GRANT pg_write_all_data TO {rt} WITH INHERIT FALSE, SET TRUE", rt=db.runtime_role
+        ),
+        "writes_workspaces",
+    ),
     "member of the owner": (
         lambda db: _admin(db, "GRANT {owner} TO {rt}", owner=db.owner_role, rt=db.runtime_role),
         "owns_relation",
@@ -343,6 +363,49 @@ def test_membership_in_a_bypassrls_role_is_unsafe(
         assert "bypassrls" in caplog.text
     finally:
         _admin(migrated, "DROP ROLE {role}", role=privileged)
+
+
+@pytest.mark.parametrize(
+    ("membership", "noinherit"),
+    [
+        ("WITH INHERIT FALSE, SET TRUE", False),
+        ("", True),
+        ("WITH ADMIN TRUE, INHERIT FALSE, SET FALSE", False),
+    ],
+    ids=["set-only", "noinherit-login", "admin-only"],
+)
+def test_privileges_reachable_only_through_another_role_count(
+    migrated: TenantDatabase,
+    membership: LiteralString,
+    noinherit: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A role it can SET ROLE to, or grant itself, is as usable as an inherited one."""
+    writer = f"{migrated.runtime_role}_w"
+    _admin(migrated, "CREATE ROLE {role} NOLOGIN", role=writer)
+    try:
+        _admin(
+            migrated,
+            # TRUNCATE ignores row-level security; INSERT would forge the schema revision.
+            "GRANT TRUNCATE ON slack_workspaces TO {role}; "
+            "GRANT INSERT ON alembic_version TO {role}; "
+            "GRANT CREATE ON SCHEMA public TO {role}; GRANT CREATE ON DATABASE {name} TO {role}",
+            role=writer,
+            name=migrated.name,
+        )
+        if noinherit:
+            _admin(migrated, "ALTER ROLE {rt} NOINHERIT", rt=migrated.runtime_role)
+        grant = "GRANT {role} TO {rt} " + membership
+        _admin(migrated, grant, role=writer, rt=migrated.runtime_role)
+        with caplog.at_level(logging.WARNING):
+            assert _ready(migrated.runtime_url) is False
+        codes = caplog.text.split(UNSAFE, 1)[1].splitlines()[0].split(" (", 1)[1]
+        for code in ("writes_schema_revision", "writes_workspaces", "schema_create"):
+            assert code in codes
+        assert "database_create" in codes
+    finally:
+        _admin(migrated, "DROP OWNED BY {role}", role=writer)
+        _admin(migrated, "DROP ROLE {role}", role=writer)
 
 
 def test_a_default_set_role_does_not_hide_the_login_roles_memberships(
