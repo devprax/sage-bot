@@ -160,7 +160,7 @@ acl_objects AS (
 grants AS (
     -- Grants to the runtime role, a role it belongs to, or PUBLIC (grantee 0).
     SELECT o.catalog, o.object, o.subobject, o.kind, o.owner, a.grantee, a.privilege_type,
-        -- The runtime allow-list. Never NULL, so NOT allowed is never NULL either.
+        -- The runtime allow-list, for held roles only. Never NULL, nor is NOT allowed.
         COALESCE(
             (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
                 AND a.privilege_type = 'SELECT'
@@ -175,11 +175,19 @@ grants AS (
         ) AS allowed,
         -- For PUBLIC: what the object started with. Initial privileges recorded by initdb or
         -- an extension, or else PostgreSQL's built-in default for the object kind. initdb
-        -- grants the information_schema views to PUBLIC without recording initial privileges;
-        -- those views show only what the caller may already see.
-        COALESCE((o.catalog <> 'pg_catalog.pg_default_acl'::pg_catalog.regclass
-            AND o.schema IS NOT DISTINCT FROM 'information_schema'::pg_catalog.regnamespace
-            AND a.privilege_type IN ('SELECT', 'USAGE'))
+        -- grants USAGE on information_schema and SELECT on its views to PUBLIC without
+        -- recording initial privileges; those views show only what the caller may already
+        -- see. Its internal _pg_ relations (user mapping options among them) are not granted.
+        COALESCE((o.catalog = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+            AND o.object = 'information_schema'::pg_catalog.regnamespace
+            AND a.privilege_type = 'USAGE')
+        OR (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
+            AND o.schema = 'information_schema'::pg_catalog.regnamespace
+            AND a.privilege_type = 'SELECT'
+            AND NOT EXISTS (
+                SELECT 1 FROM pg_catalog.pg_class c
+                WHERE c.oid = o.object AND pg_catalog.starts_with(c.relname, '_pg_')
+            ))
         OR CASE WHEN o.catalog = 'pg_catalog.pg_default_acl'::pg_catalog.regclass
                   OR NOT EXISTS (
                       SELECT 1 FROM pg_catalog.pg_init_privs i
@@ -242,7 +250,8 @@ SELECT pg_catalog.concat_ws(',',
         SELECT 1 FROM grants WHERE grantee <> 0 AND NOT allowed
     ) THEN 'unexpected_privilege' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM grants WHERE grantee = 0 AND NOT allowed AND NOT initial
+        -- The runtime allow-list does not extend to PUBLIC: every role would hold it.
+        SELECT 1 FROM grants WHERE grantee = 0 AND NOT initial
     ) OR EXISTS (
         SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser = 0
     ) THEN 'public_privilege' END,

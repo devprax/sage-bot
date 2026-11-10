@@ -203,6 +203,7 @@ def test_concurrent_probes_share_one_database_check(monkeypatch: pytest.MonkeyPa
     assert len(attempts) == 1, "a probe flood must not open one connection per request"
     assert attempts[0]["connect_timeout"] == 2
     assert attempts[0]["application_name"] == "sage-bot-readiness"
+    assert attempts[0]["options"] == "-c jit=off"
     # Not cached: the next probe checks again.
     assert asyncio.run(check()) is True
     assert len(attempts) == 2

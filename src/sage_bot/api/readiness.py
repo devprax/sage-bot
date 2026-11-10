@@ -74,6 +74,9 @@ def postgres_check(
                     autocommit=True,
                     connect_timeout=connect_timeout,
                     application_name=APPLICATION_NAME,
+                    # The role check scans the catalogs; JIT compilation would cost more than
+                    # the query itself on large catalogs.
+                    options="-c jit=off",
                 )
             # The query is never cancelled: psycopg answers cancellation with a server-side
             # cancel request and further waiting, which the deadline would not bound. If the

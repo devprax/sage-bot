@@ -371,6 +371,18 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         ),
         "public_privilege",
     ),
+    "everyone reads workspaces": (
+        lambda db: _admin(db, "GRANT SELECT ON slack_workspaces TO PUBLIC"),
+        "public_privilege",
+    ),
+    "everyone reads the schema revision": (
+        lambda db: _admin(db, "GRANT SELECT ON alembic_version TO PUBLIC"),
+        "public_privilege",
+    ),
+    "everyone reads user mapping options": (
+        lambda db: _admin(db, "GRANT SELECT ON information_schema._pg_user_mappings TO PUBLIC"),
+        "public_privilege",
+    ),
     "monitoring role": (
         lambda db: _admin(db, "GRANT pg_monitor TO {rt}", rt=db.runtime_role),
         "predefined_role",
