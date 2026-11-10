@@ -1,8 +1,6 @@
 """Readiness and schema migrations against a real PostgreSQL server.
 
-Set SAGE_TEST_DATABASE_URL to a disposable database whose user may create databases. They are
-skipped locally without it, and fail in CI if it is missing, so they can never pass by being
-skipped. Each test that migrates gets its own temporary database, dropped afterwards.
+Fixtures are in conftest.py. Each test that migrates gets its own temporary database.
 """
 
 import asyncio
@@ -12,16 +10,14 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
-from uuid import uuid4
+from urllib.parse import urlsplit
 
 import psycopg
 import pytest
 from alembic import command
 from fastapi.testclient import TestClient
-from psycopg import sql
+from pg_support import url_with
 
 from sage_bot.api.app import create_app
 from sage_bot.api.readiness import postgres_check, readiness_from_environment
@@ -31,41 +27,6 @@ from sage_bot.db.migrate import MIGRATION_LOCK_KEY
 ENCRYPTION_KEY = base64.b64encode(bytes(range(32))).decode()
 # Deliberately wrong credential for rejection tests; never a real password.
 WRONG_PASSWORD = "wrong-password-for-test"  # noqa: S105
-
-
-@pytest.fixture
-def database_url() -> str:
-    url = os.environ.get("SAGE_TEST_DATABASE_URL", "")
-    if not url:
-        if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
-            pytest.fail("SAGE_TEST_DATABASE_URL must be set in CI")
-        pytest.skip("set SAGE_TEST_DATABASE_URL to run PostgreSQL integration tests")
-    return url
-
-
-def _with(url: str, *, password: str | None = None, database: str | None = None) -> str:
-    parts = urlsplit(url)
-    netloc = parts.netloc
-    if password is not None:
-        credentials, _, host = netloc.rpartition("@")
-        netloc = f"{credentials.split(':')[0]}:{password}@{host}"
-    path = f"/{database}" if database is not None else parts.path
-    return urlunsplit(parts._replace(netloc=netloc, path=path))
-
-
-@pytest.fixture
-def fresh_database(database_url: str) -> Iterator[str]:
-    """An empty database for one test, so migrations never touch shared state."""
-    name = f"sage_test_{uuid4().hex[:12]}"
-    with psycopg.connect(database_url, autocommit=True) as admin:
-        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
-    try:
-        yield _with(database_url, database=name)
-    finally:
-        with psycopg.connect(database_url, autocommit=True) as admin:
-            admin.execute(
-                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
-            )
 
 
 def _ready(url: str) -> bool:
@@ -120,7 +81,7 @@ def test_rejected_connection_is_not_ready_and_not_logged(
     database_url: str, change: dict[str, str], caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.WARNING):
-        assert _ready(_with(database_url, **change)) is False
+        assert _ready(url_with(database_url, **change)) is False
     assert "database check failed" in caplog.text
     real_password = urlsplit(database_url).password
     assert real_password is not None
@@ -152,7 +113,7 @@ def test_migrate_command_brings_a_fresh_database_to_ready(fresh_database: str) -
 
 
 def test_migrate_command_failure_reveals_no_credentials(database_url: str) -> None:
-    result = _migrate_command(_with(database_url, password=WRONG_PASSWORD))
+    result = _migrate_command(url_with(database_url, password=WRONG_PASSWORD))
     assert result.returncode == 1
     assert "migration failed (OperationalError)" in result.stderr
     output = result.stdout + result.stderr
@@ -196,6 +157,7 @@ def test_concurrent_migrate_commands_both_succeed(fresh_database: str) -> None:
         results = [runner.communicate(timeout=60) for runner in runners]
         assert [runner.returncode for runner in runners] == [0] * 4, results
         assert _recorded(fresh_database) == [(migrate.expected_revision(),)]
+        command.downgrade(migrate.alembic_config(fresh_database), "base")
         with psycopg.connect(fresh_database, autocommit=True) as connection:
             connection.execute("DROP TABLE alembic_version")
 

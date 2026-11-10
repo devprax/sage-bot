@@ -33,7 +33,7 @@ def valid_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_the_single_migration_head_is_the_expected_revision() -> None:
     heads = ScriptDirectory.from_config(migrate.alembic_config()).get_heads()
     assert heads == [migrate.expected_revision()]
-    assert migrate.expected_revision() == "0001"
+    assert migrate.expected_revision() == "0002"
 
 
 def test_migrations_ship_inside_the_package() -> None:
@@ -89,7 +89,7 @@ def test_successful_migration_reports_the_revision(
     assert migrate.main([]) == 0
     assert upgraded == [f"postgresql://sage:{PASSWORD}@127.0.0.1:5432/sage"]
     output = capsys.readouterr()
-    assert output.out == "database schema is at revision 0001\n"
+    assert output.out == f"database schema is at revision {migrate.expected_revision()}\n"
     assert PASSWORD not in output.out + output.err
 
 

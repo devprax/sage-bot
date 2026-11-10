@@ -28,9 +28,22 @@ Schema migrations are an explicit step: run `sage-bot-migrate` (or `python -m sa
 
 The server binds to the local interface unless `--host` is given. Port `0` picks a free port. The server does not send a `Server` header, does not trust forwarded headers, and does not write an access log, since request lines can carry credentials. Once the server has started, SIGTERM and Ctrl+C both shut it down gracefully: the process then exits with status 0 after SIGTERM and 130 after Ctrl+C. A signal that arrives while the process is still starting stops it with the default signal status. `python -m sage_bot.api.server` is equivalent.
 
+### Workspaces and tenant isolation
+
+Each Slack workspace has one record in `slack_workspaces`: an internal UUID, its unique Slack team ID, a creation time and a status, which is `disabled` until explicitly enabled. Nothing in this release enables a workspace, registers one, or serves workspace data over HTTP.
+
+Access is split by trust:
+
+- **Provisioning** (`sage_bot.db.workspaces.PostgresWorkspaceProvisioning`) is trusted. It registers a team and finds any team without a tenant context, so it connects as the role that owns the schema, the same role that runs `sage-bot-migrate`. Registration is idempotent: registering a team again, including concurrently, returns the same workspace (`created` is true exactly once) and never changes its status.
+- **Tenant-scoped access** (`PostgresTenantWorkspaces`, `tenant_transaction`) binds each transaction to one workspace through the `sage.workspace_id` setting. Row-level security then exposes only that workspace's row; without the setting, no rows. It must connect as a separate role that does not own the tables and has neither superuser nor `BYPASSRLS`. Such a role cannot disable or change the policy. Grant it only `SELECT ON slack_workspaces`, as the owner. Never grant it `TRUNCATE`, which ignores row-level security. Write privileges would also let it learn whether another workspace's team ID exists, through the unique constraint.
+
+The policy limits a transaction to the workspace it is bound to; it does not decide which workspace that is. Any session of the runtime role can bind itself to a workspace whose UUID it knows. It protects against unscoped or mis-scoped queries, not against stolen runtime credentials. Code must bind only to a workspace resolved on the server from an authenticated source, never from caller input.
+
+Row-level security is enabled but not forced, because the owning role is the trusted provisioning role. A SECURITY DEFINER function owned by that role bypasses the policy only when it is not forced. Resolving a Slack team to its workspace at ingress is planned as such a narrow function, executable by the runtime role; until then, only provisioning can resolve a team. Today the server and `sage-bot-migrate` share one `DATABASE_URL`, so separate migration and runtime credentials must be introduced before any code serves tenant data. These guarantees assume PostgreSQL 15 or later, where ordinary roles cannot create objects in the `public` schema; CI uses 17.
+
 ### PostgreSQL integration tests
 
-These tests run when `SAGE_TEST_DATABASE_URL` points to a disposable database. Otherwise they are skipped locally, and they fail in CI, which provides a PostgreSQL service. For example, with Podman (or Docker):
+These tests run when `SAGE_TEST_DATABASE_URL` points to a disposable database whose user can create databases and roles; each test creates its own and drops them afterwards. Otherwise they are skipped locally, and they fail in CI, which provides a PostgreSQL service. For example, with Podman (or Docker):
 
 ```sh
 podman run -d --rm --name sage-test-db -p 127.0.0.1:55432:5432 \
