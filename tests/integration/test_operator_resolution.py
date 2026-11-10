@@ -1,11 +1,12 @@
-"""The trusted queries bind only pg_catalog's operators and functions, whatever is on the path.
+"""The trusted queries bind only pg_catalog's operators, whatever is on the search path.
 
 PostgreSQL prefers an operator whose argument types match exactly, in any schema on the search
 path, over a pg_catalog operator that needs a coercion. This plants every such operator over a
-matrix of types, compiles each query as a view, and checks what the view depends on.
+matrix of types, compiles each query as a view, and checks what the view depends on. (Function
+calls in these queries are all schema-qualified; this test plants only operators.)
 """
 
-from typing import LiteralString, cast
+from typing import Any, LiteralString, cast
 
 import psycopg
 import pytest
@@ -107,15 +108,22 @@ def planted(fresh_database: str) -> str:
     return fresh_database
 
 
-@pytest.mark.parametrize("name", list(_queries()))
-def test_trusted_queries_bind_only_built_in_operators_and_functions(
-    planted: str, name: str
-) -> None:
+def _foreign_dependencies(database: str, name: str, query: LiteralString) -> list[Any]:
     view = sql.Identifier("plant", f"v_{name}")
-    with psycopg.connect(planted, autocommit=True) as admin:
+    with psycopg.connect(database, autocommit=True) as admin:
         admin.execute('SET search_path = "$user", plant, public')
-        admin.execute(sql.SQL("CREATE VIEW {} AS ").format(view) + sql.SQL(_queries()[name]))
+        admin.execute(sql.SQL("CREATE VIEW {} AS ").format(view) + sql.SQL(query))
         # Read the dependencies with nothing planted on the path.
         admin.execute("SET search_path = pg_catalog")
-        foreign = admin.execute(_FOREIGN_DEPENDENCIES, (f"plant.v_{name}",)).fetchall()
-    assert foreign == []
+        return admin.execute(_FOREIGN_DEPENDENCIES, (f"plant.v_{name}",)).fetchall()
+
+
+def test_a_captured_comparison_is_detected(planted: str) -> None:
+    """The check itself works: an unqualified oid = regclass binds a planted operator."""
+    control = "SELECT 1::pg_catalog.oid = 'pg_class'::pg_catalog.regclass AS captured"
+    assert len(_foreign_dependencies(planted, "control", control)) == 1
+
+
+@pytest.mark.parametrize("name", list(_queries()))
+def test_trusted_queries_bind_only_built_in_operators(planted: str, name: str) -> None:
+    assert _foreign_dependencies(planted, name, _queries()[name]) == []
