@@ -146,7 +146,26 @@ def test_repeated_registration_keeps_one_identity_and_never_changes_status(
     assert _rows(migrated.owner_url) == [(TEAM_A, "enabled"), (TEAM_B, "disabled")]
 
 
-def test_concurrent_registration_creates_exactly_one_workspace(migrated: TenantDatabase) -> None:
+# Registration must behave the same whatever isolation level the server defaults to.
+ISOLATION_LEVELS = pytest.mark.parametrize(
+    "isolation", ["read committed", "repeatable read", "serializable"]
+)
+
+
+def _default_isolation(database: TenantDatabase, isolation: str) -> None:
+    with psycopg.connect(database.owner_url, autocommit=True) as owner:
+        owner.execute(
+            sql.SQL("ALTER DATABASE {} SET default_transaction_isolation = {}").format(
+                sql.Identifier(database.name), sql.Literal(isolation)
+            )
+        )
+
+
+@ISOLATION_LEVELS
+def test_concurrent_registration_creates_exactly_one_workspace(
+    migrated: TenantDatabase, isolation: str
+) -> None:
+    _default_isolation(migrated, isolation)
     provisioning = PostgresWorkspaceProvisioning(migrated.owner_url)
 
     async def register_many() -> list[tuple[Workspace, bool]]:
@@ -164,10 +183,12 @@ def test_concurrent_registration_creates_exactly_one_workspace(migrated: TenantD
     assert _rows(migrated.owner_url) == [(TEAM_A, "disabled")]
 
 
+@ISOLATION_LEVELS
 def test_registration_racing_an_uncommitted_insert_returns_the_committed_identity(
-    migrated: TenantDatabase,
+    migrated: TenantDatabase, isolation: str
 ) -> None:
     """Registrations that block on a concurrent insert return that row once it commits."""
+    _default_isolation(migrated, isolation)
     provisioning = PostgresWorkspaceProvisioning(migrated.owner_url)
 
     async def race(blocker: psycopg.Connection, monitor: psycopg.Connection) -> list[bool]:
@@ -366,6 +387,26 @@ def test_tenant_context_ends_with_the_transaction(migrated: TenantDatabase) -> N
     inside, after = asyncio.run(scenario())
     assert inside == (str(a.id),)
     assert after in {("",), (None,)}
+
+
+def test_tenant_transaction_refuses_a_connection_already_bound_to_a_workspace(
+    migrated: TenantDatabase,
+) -> None:
+    a, _ = _register(migrated.owner_url, TEAM_A)
+    b, _ = _register(migrated.owner_url, TEAM_B)
+
+    async def scenario() -> None:
+        async with await psycopg.AsyncConnection.connect(
+            migrated.runtime_url, autocommit=True
+        ) as connection:
+            await connection.execute(
+                "SELECT set_config('sage.workspace_id', %s, false)", (str(b.id),)
+            )
+            async with tenant_transaction(connection, a.id):
+                pass
+
+    with pytest.raises(RuntimeError, match="already bound"):
+        asyncio.run(scenario())
 
 
 def test_tenant_transaction_refuses_to_join_an_open_transaction(migrated: TenantDatabase) -> None:

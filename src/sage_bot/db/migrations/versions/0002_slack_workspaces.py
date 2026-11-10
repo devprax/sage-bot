@@ -36,7 +36,8 @@ def upgrade() -> None:
             "slack_team_id ~ '^T[A-Z0-9]{1,31}$'", name="ck_slack_workspaces_slack_team_id"
         ),
     )
-    # Enabled, not forced: the owning role is the trusted provisioning role.
+    # Enabled, not forced: the owning role is the trusted provisioning role, and functions it
+    # defines with SECURITY DEFINER can bypass the policy only while it is not forced.
     op.execute("ALTER TABLE slack_workspaces ENABLE ROW LEVEL SECURITY")
     op.execute(
         "CREATE POLICY tenant_isolation ON slack_workspaces "

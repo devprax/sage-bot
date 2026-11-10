@@ -53,19 +53,19 @@ def tenant_database(database_url: str) -> Iterator[TenantDatabase]:
     # Random per-test credentials for roles that exist only for this test.
     owner_password, runtime_password = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
     restricted = sql.SQL("LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS")
-    with psycopg.connect(database_url, autocommit=True) as admin:
-        for role, password in ((owner, owner_password), (runtime, runtime_password)):
+    try:
+        with psycopg.connect(database_url, autocommit=True) as admin:
+            for role, password in ((owner, owner_password), (runtime, runtime_password)):
+                admin.execute(
+                    sql.SQL("CREATE ROLE {} {} PASSWORD {}").format(
+                        sql.Identifier(role), restricted, sql.Literal(password)
+                    )
+                )
             admin.execute(
-                sql.SQL("CREATE ROLE {} {} PASSWORD {}").format(
-                    sql.Identifier(role), restricted, sql.Literal(password)
+                sql.SQL("CREATE DATABASE {} OWNER {}").format(
+                    sql.Identifier(name), sql.Identifier(owner)
                 )
             )
-        admin.execute(
-            sql.SQL("CREATE DATABASE {} OWNER {}").format(
-                sql.Identifier(name), sql.Identifier(owner)
-            )
-        )
-    try:
         yield TenantDatabase(
             name=name,
             admin_url=url_with(database_url, database=name),
@@ -77,8 +77,10 @@ def tenant_database(database_url: str) -> Iterator[TenantDatabase]:
             ),
         )
     finally:
-        # Dropping the database first removes the roles' privileges in it.
-        _drop_database(database_url, name)
-        with psycopg.connect(database_url, autocommit=True) as admin:
-            for role in (runtime, owner):
-                admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+        try:
+            # Dropping the database first removes the roles' privileges in it.
+            _drop_database(database_url, name)
+        finally:
+            with psycopg.connect(database_url, autocommit=True) as admin:
+                for role in (runtime, owner):
+                    admin.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))

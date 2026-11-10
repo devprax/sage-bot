@@ -57,7 +57,7 @@ def test_registration_rejects_an_invalid_team_before_connecting() -> None:
         asyncio.run(provisioning.find_by_slack_team("not-a-team"))
 
 
-def test_new_workspaces_are_disabled() -> None:
+def test_workspace_statuses_are_disabled_and_enabled() -> None:
     assert WorkspaceStatus.DISABLED.value == "disabled"
     assert {status.value for status in WorkspaceStatus} == {"disabled", "enabled"}
 
