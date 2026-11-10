@@ -165,6 +165,9 @@ class _FakeCursor:
         return self._row
 
 
+_QUERIES: list[str] = []
+
+
 class _FakeInfo:
     server_version = 170000
 
@@ -179,6 +182,7 @@ class _FakeConnection:
         return None
 
     async def execute(self, query: str) -> _FakeCursor:
+        _QUERIES.append(query)
         return _FakeCursor(query)
 
     async def close(self) -> None:
@@ -203,7 +207,9 @@ def test_concurrent_probes_share_one_database_check(monkeypatch: pytest.MonkeyPa
     assert len(attempts) == 1, "a probe flood must not open one connection per request"
     assert attempts[0]["connect_timeout"] == 2
     assert attempts[0]["application_name"] == "sage-bot-readiness"
-    assert attempts[0]["options"] == "-c jit=off"
+    assert "options" not in attempts[0], "connection options would replace the URL's options"
+    # JIT is disabled with SET instead, after the revision matches.
+    assert "SET jit = off" in _QUERIES
     # Not cached: the next probe checks again.
     assert asyncio.run(check()) is True
     assert len(attempts) == 2

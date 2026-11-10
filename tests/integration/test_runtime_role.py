@@ -622,6 +622,19 @@ def test_public_defaults_made_explicit_are_not_flagged(
     assert caplog.text == ""
 
 
+def test_options_in_the_runtime_url_are_honoured(
+    migrated: TenantDatabase, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Readiness checks the search path the application would use, not a default one."""
+    _admin(migrated, "CREATE SCHEMA shadow AUTHORIZATION {rt}", rt=migrated.runtime_role)
+    url = f"{migrated.runtime_url}?options=-csearch_path%3Dshadow,public"
+    with caplog.at_level(logging.WARNING):
+        assert _ready(url) is False
+    assert "owns_schema" in caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
+    for secret in _secrets(migrated.runtime_url):
+        assert secret not in caplog.text
+
+
 @pytest.mark.parametrize("credentials", ["owner", "superuser"])
 def test_privileged_credentials_as_runtime_are_not_ready(
     migrated: TenantDatabase, credentials: str, caplog: pytest.LogCaptureFixture

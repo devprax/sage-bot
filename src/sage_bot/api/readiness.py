@@ -74,9 +74,6 @@ def postgres_check(
                     autocommit=True,
                     connect_timeout=connect_timeout,
                     application_name=APPLICATION_NAME,
-                    # The role check scans the catalogs; JIT compilation would cost more than
-                    # the query itself on large catalogs.
-                    options="-c jit=off",
                 )
             # The query is never cancelled: psycopg answers cancellation with a server-side
             # cancel request and further waiting, which the deadline would not bound. If the
@@ -123,6 +120,10 @@ async def _inspect(
     revisions = await cursor.fetchall()
     if revisions != [(expected_revision,)]:
         return revisions, []
+    # The role check scans the catalogs; JIT compilation would cost more than the query on
+    # large catalogs. Set here rather than in connection options, which would replace any
+    # options (such as search_path) the deployment put in DATABASE_URL.
+    await connection.execute("SET jit = off")
     results: list[object] = []
     checks = [ROLE_CHECK]
     if connection.info.server_version >= PARAMETER_CHECK_MIN_SERVER_VERSION:
