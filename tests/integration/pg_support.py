@@ -3,6 +3,9 @@
 from dataclasses import dataclass
 from urllib.parse import quote, urlsplit, urlunsplit
 
+import psycopg
+from psycopg import sql
+
 
 def url_with(
     url: str,
@@ -42,3 +45,13 @@ class TenantDatabase:
     owner_url: str
     runtime_role: str
     runtime_url: str
+
+
+def grant_runtime_access(owner_url: str, runtime_role: str) -> None:
+    """Apply the runtime grant the README documents, as the owning role."""
+    with psycopg.connect(owner_url, autocommit=True) as owner:
+        owner.execute(
+            sql.SQL("GRANT SELECT ON alembic_version, slack_workspaces TO {}").format(
+                sql.Identifier(runtime_role)
+            )
+        )

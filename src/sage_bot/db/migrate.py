@@ -1,7 +1,8 @@
 """Upgrade the database schema to this release's revision.
 
-Run `sage-bot-migrate` or `python -m sage_bot.db.migrate` as an explicit deployment step; the
-server never migrates on startup. Readiness reports not ready until the recorded revision
+Run `sage-bot-migrate` or `python -m sage_bot.db.migrate` as an explicit deployment step, with
+`MIGRATION_DATABASE_URL` set to the role that owns the schema; the server never migrates on
+startup and never receives these credentials. Readiness reports not ready until the recorded revision
 matches `expected_revision()`.
 """
 
@@ -14,7 +15,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from pydantic import ValidationError
 
-from sage_bot.config.settings import Settings
+from sage_bot.config.settings import MigrationSettings
 
 SCRIPT_LOCATION = "sage_bot.db:migrations"
 # Serializes concurrent migration runs, for example two replicas starting together.
@@ -64,7 +65,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.parse_args(argv)
     try:
-        settings = Settings()
+        settings = MigrationSettings()
     except ValidationError as error:
         print(
             f"sage-bot-migrate: settings are missing or invalid ({error.error_count()} errors)",
@@ -72,7 +73,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
     try:
-        upgrade(settings.database_url.get_secret_value())
+        upgrade(settings.migration_database_url.get_secret_value())
     except Exception as error:  # report the type only; messages can carry connection details
         print(f"sage-bot-migrate: migration failed ({type(error).__name__})", file=sys.stderr)
         return 1

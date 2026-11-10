@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from sage_bot.config.settings import Settings
+from sage_bot.config.settings import MigrationSettings, Settings
 
 # Synthetic fixtures only; no service is contacted by these tests.
 DATABASE_URL = "postgresql://test_user:test_password@localhost:5432/sage_test"
@@ -14,7 +14,13 @@ ENCRYPTION_KEY = base64.b64encode(bytes(range(32))).decode()
 
 @pytest.fixture(autouse=True)
 def isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    names = {"SAGE_ENV", "DATABASE_URL", "SAGE_ENCRYPTION_KEY", "READINESS_TIMEOUT_SECONDS"}
+    names = {
+        "SAGE_ENV",
+        "DATABASE_URL",
+        "MIGRATION_DATABASE_URL",
+        "SAGE_ENCRYPTION_KEY",
+        "READINESS_TIMEOUT_SECONDS",
+    }
     for name in list(os.environ):
         if name.upper() in names:
             monkeypatch.delenv(name)
@@ -192,3 +198,65 @@ def test_dotenv_is_not_loaded_implicitly(
         ("DATABASE_URL",),
         ("SAGE_ENCRYPTION_KEY",),
     }
+
+
+# Migration settings
+
+
+MIGRATION_URL = "postgresql://migrator:migrator_password@localhost:5432/sage_test"
+
+
+def test_runtime_settings_neither_require_nor_read_migration_credentials(
+    inputs: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name, value in inputs.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", "not a url")
+    settings = Settings()
+    assert "migration" not in " ".join(type(settings).model_fields)
+    assert settings.database_url.get_secret_value() == DATABASE_URL
+
+
+def test_migration_settings_read_only_the_migration_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", MIGRATION_URL)
+    settings = MigrationSettings()
+    assert settings.migration_database_url.get_secret_value() == MIGRATION_URL
+    assert set(type(settings).model_fields) == {"migration_database_url"}
+
+
+def test_migration_settings_do_not_fall_back_to_the_runtime_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", DATABASE_URL)
+    monkeypatch.setenv("SAGE_ENCRYPTION_KEY", ENCRYPTION_KEY)
+    with pytest.raises(ValidationError) as error:
+        MigrationSettings()
+    assert error.value.errors(include_input=False)[0]["loc"] == ("MIGRATION_DATABASE_URL",)
+    assert DATABASE_URL not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "sqlite:///migrator_password.db",
+        "postgresql://migrator:REPLACE_ME@localhost/sage_test",
+        "postgresql://migrator@localhost/sage_test",
+        "postgresql://migrator:migrator_password@localhost:bad-port/sage_test",
+    ],
+)
+def test_invalid_migration_url_is_rejected_without_disclosing_input(
+    monkeypatch: pytest.MonkeyPatch, url: str
+) -> None:
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", url)
+    with pytest.raises(ValidationError) as error:
+        MigrationSettings()
+    assert "a PostgreSQL URL" in str(error.value)
+    assert url not in str(error.value)
+    assert "migrator_password" not in str(error.value)
+
+
+def test_migration_url_is_redacted_in_representations(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", MIGRATION_URL)
+    settings = MigrationSettings()
+    assert "migrator_password" not in repr(settings)
+    assert "migrator_password" not in str(settings.model_dump())

@@ -12,6 +12,7 @@ ENCRYPTION_KEY = base64.b64encode(bytes(range(32))).decode()
 SETTINGS_VARIABLES = {
     "SAGE_ENV",
     "DATABASE_URL",
+    "MIGRATION_DATABASE_URL",
     "SAGE_ENCRYPTION_KEY",
     "READINESS_TIMEOUT_SECONDS",
 }
@@ -26,8 +27,10 @@ def isolated_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def valid_settings(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DATABASE_URL", f"postgresql://sage:{PASSWORD}@127.0.0.1:5432/sage")
-    monkeypatch.setenv("SAGE_ENCRYPTION_KEY", ENCRYPTION_KEY)
+    # Only the migration URL: the command needs no runtime settings.
+    monkeypatch.setenv(
+        "MIGRATION_DATABASE_URL", f"postgresql://sage:{PASSWORD}@127.0.0.1:5432/sage"
+    )
 
 
 def test_the_single_migration_head_is_the_expected_revision() -> None:
@@ -58,11 +61,24 @@ def test_database_url_is_not_stored_in_the_alembic_options() -> None:
 def test_invalid_settings_exit_2_without_values(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{PASSWORD}.db")
-    monkeypatch.setenv("SAGE_ENCRYPTION_KEY", ENCRYPTION_KEY)
+    monkeypatch.setenv("MIGRATION_DATABASE_URL", f"sqlite:///{PASSWORD}.db")
     assert migrate.main([]) == 2
     output = capsys.readouterr()
     assert "settings are missing or invalid" in output.err
+    assert PASSWORD not in output.out + output.err
+
+
+def test_runtime_credentials_are_never_used_for_migration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    upgraded: list[str] = []
+    monkeypatch.setattr(migrate, "upgrade", upgraded.append)
+    monkeypatch.setenv("DATABASE_URL", f"postgresql://sage:{PASSWORD}@127.0.0.1:5432/sage")
+    monkeypatch.setenv("SAGE_ENCRYPTION_KEY", ENCRYPTION_KEY)
+    assert migrate.main([]) == 2
+    assert upgraded == []
+    output = capsys.readouterr()
+    assert "settings are missing or invalid (1 errors)" in output.err
     assert PASSWORD not in output.out + output.err
 
 

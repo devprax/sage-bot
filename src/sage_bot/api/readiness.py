@@ -1,7 +1,9 @@
 """Readiness: whether the service can do work, as opposed to whether the process is alive.
 
-The service is ready when its settings are valid and PostgreSQL reports the schema revision
-this release expects, within the readiness timeout.
+The service is ready when its settings are valid and, within the readiness timeout, PostgreSQL
+reports the schema revision this release expects and the runtime role is restricted: it cannot
+bypass tenant isolation, change the schema or provision workspaces, and it can read what
+tenant-scoped code needs (see `sage_bot.db.runtime_role`).
 
 A check never raises and never reports why it failed beyond an exception class name, because
 dependency errors can carry credentials and infrastructure details.
@@ -18,6 +20,7 @@ from pydantic import ValidationError
 
 from sage_bot.config.settings import Settings
 from sage_bot.db.migrate import expected_revision
+from sage_bot.db.runtime_role import ROLE_CHECK, parse_problems
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +42,12 @@ async def not_configured() -> bool:
 def postgres_check(
     database_url: str, *, timeout_seconds: float, expected_revision: str
 ) -> ReadinessCheck:
-    """Ready when PostgreSQL answers within the timeout with the expected schema revision.
+    """Ready when PostgreSQL answers within the timeout with the expected schema revision, and
+    the connected role passes the runtime role check.
 
     The revision is the one Alembic records in `alembic_version`; a database that has not been
-    migrated, or is at another revision, is not ready.
+    migrated, or is at another revision, is not ready. The role check runs on the same
+    connection, within the same deadline, once the revision matches.
 
     Concurrent probes share one in-flight check, so a burst of probes opens one database
     connection rather than one per request. Results are not cached: the next probe after a
@@ -68,11 +73,11 @@ def postgres_check(
             # The query is never cancelled: psycopg answers cancellation with a server-side
             # cancel request and further waiting, which the deadline would not bound. If the
             # deadline passes, closing the connection ends the query instead.
-            query = asyncio.create_task(_recorded_revisions(connection))
+            query = asyncio.create_task(_inspect(connection, expected_revision))
             done, _ = await asyncio.wait({query}, timeout=max(0.0, deadline - loop.time()))
             if query not in done:
                 raise TimeoutError
-            revisions = await query
+            revisions, problems = await query
         except Exception as error:  # any failure means not ready
             logger.warning("readiness: database check failed (%s)", type(error).__name__)
             return False
@@ -80,6 +85,10 @@ def postgres_check(
             await _discard(connection, query)
         if revisions != [(expected_revision,)]:
             logger.warning("readiness: database schema is not at the expected revision")
+            return False
+        if problems:
+            # Fixed codes only; never role names or values.
+            logger.warning("readiness: runtime database role is unsafe (%s)", ",".join(problems))
             return False
         return True
 
@@ -98,9 +107,17 @@ def postgres_check(
     return check
 
 
-async def _recorded_revisions(connection: psycopg.AsyncConnection[Any]) -> list[Any]:
+async def _inspect(
+    connection: psycopg.AsyncConnection[Any], expected_revision: str
+) -> tuple[list[Any], list[str]]:
+    """The recorded revisions and, if they match, the runtime role's problems."""
     cursor = await connection.execute("SELECT version_num FROM alembic_version")
-    return await cursor.fetchall()
+    revisions = await cursor.fetchall()
+    if revisions != [(expected_revision,)]:
+        return revisions, []
+    cursor = await connection.execute(ROLE_CHECK)
+    row = await cursor.fetchone()
+    return revisions, parse_problems(row[0] if row is not None else None)
 
 
 async def _discard(

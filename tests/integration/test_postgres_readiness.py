@@ -17,7 +17,7 @@ import psycopg
 import pytest
 from alembic import command
 from fastapi.testclient import TestClient
-from pg_support import url_with
+from pg_support import TenantDatabase, grant_runtime_access, url_with
 
 from sage_bot.api.app import create_app
 from sage_bot.api.readiness import postgres_check, readiness_from_environment
@@ -48,14 +48,13 @@ def test_unmigrated_database_is_not_ready(
 
 
 def test_migrated_database_is_ready_and_migrating_again_changes_nothing(
-    fresh_database: str,
+    migrated: TenantDatabase,
 ) -> None:
-    migrate.upgrade(fresh_database)
-    assert _recorded(fresh_database) == [(migrate.expected_revision(),)]
-    assert _ready(fresh_database) is True
-    migrate.upgrade(fresh_database)
-    assert _recorded(fresh_database) == [(migrate.expected_revision(),)]
-    assert _ready(fresh_database) is True
+    assert _recorded(migrated.admin_url) == [(migrate.expected_revision(),)]
+    assert _ready(migrated.runtime_url) is True
+    migrate.upgrade(migrated.owner_url)
+    assert _recorded(migrated.admin_url) == [(migrate.expected_revision(),)]
+    assert _ready(migrated.runtime_url) is True
 
 
 def test_downgraded_database_is_not_ready(
@@ -89,12 +88,18 @@ def test_rejected_connection_is_not_ready_and_not_logged(
     assert WRONG_PASSWORD not in caplog.text
 
 
-def _migrate_command(url: str) -> subprocess.CompletedProcess[str]:
-    env = {
-        **{k: v for k, v in os.environ.items() if not k.upper().startswith("SAGE_")},
-        "DATABASE_URL": url,
-        "SAGE_ENCRYPTION_KEY": ENCRYPTION_KEY,
+def _migration_environment(url: str) -> dict[str, str]:
+    inherited = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.upper().startswith("SAGE_")
+        and name.upper() not in {"DATABASE_URL", "MIGRATION_DATABASE_URL"}
     }
+    return {**inherited, "MIGRATION_DATABASE_URL": url}
+
+
+def _migrate_command(url: str) -> subprocess.CompletedProcess[str]:
+    env = _migration_environment(url)
     return subprocess.run(  # noqa: S603 -- fixed argv: this interpreter + our module
         [sys.executable, "-m", "sage_bot.db.migrate"],
         capture_output=True,
@@ -105,11 +110,14 @@ def _migrate_command(url: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_migrate_command_brings_a_fresh_database_to_ready(fresh_database: str) -> None:
-    result = _migrate_command(fresh_database)
+def test_migrate_command_brings_a_fresh_database_to_ready(
+    tenant_database: TenantDatabase,
+) -> None:
+    result = _migrate_command(tenant_database.owner_url)
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"database schema is at revision {migrate.expected_revision()}\n"
-    assert _ready(fresh_database) is True
+    grant_runtime_access(tenant_database.owner_url, tenant_database.runtime_role)
+    assert _ready(tenant_database.runtime_url) is True
 
 
 def test_migrate_command_failure_reveals_no_credentials(database_url: str) -> None:
@@ -124,13 +132,16 @@ def test_migrate_command_failure_reveals_no_credentials(database_url: str) -> No
 
 
 def test_service_is_ready_once_migrated(
-    fresh_database: str, monkeypatch: pytest.MonkeyPatch
+    tenant_database: TenantDatabase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("DATABASE_URL", fresh_database)
+    monkeypatch.setenv("DATABASE_URL", tenant_database.runtime_url)
     monkeypatch.setenv("SAGE_ENCRYPTION_KEY", ENCRYPTION_KEY)
     client = TestClient(create_app(readiness=readiness_from_environment()))
     assert client.get("/health/ready").status_code == 503
-    migrate.upgrade(fresh_database)
+    migrate.upgrade(tenant_database.owner_url)
+    # Migrated but not yet granted: still not ready.
+    assert client.get("/health/ready").status_code == 503
+    grant_runtime_access(tenant_database.owner_url, tenant_database.runtime_role)
     response = client.get("/health/ready")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -138,11 +149,7 @@ def test_service_is_ready_once_migrated(
 
 
 def test_concurrent_migrate_commands_both_succeed(fresh_database: str) -> None:
-    env = {
-        **{k: v for k, v in os.environ.items() if not k.upper().startswith("SAGE_")},
-        "DATABASE_URL": fresh_database,
-        "SAGE_ENCRYPTION_KEY": ENCRYPTION_KEY,
-    }
+    env = _migration_environment(fresh_database)
     for _ in range(3):
         runners = [
             subprocess.Popen(  # noqa: S603 -- fixed argv: this interpreter + our module

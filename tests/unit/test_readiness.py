@@ -18,6 +18,7 @@ from sage_bot.api.readiness import (
     postgres_check,
     readiness_from_environment,
 )
+from sage_bot.db.runtime_role import ROLE_CHECK, ROLE_CHECK_MARKER
 
 # Synthetic credentials only; nothing here reaches a real database.
 PASSWORD = "readiness-test-password"  # noqa: S105
@@ -154,8 +155,14 @@ def test_valid_settings_check_the_configured_database(
 
 
 class _FakeCursor:
+    def __init__(self, query: str) -> None:
+        self._row = ("",) if ROLE_CHECK_MARKER in query else (REVISION,)
+
     async def fetchall(self) -> list[tuple[str]]:
-        return [(REVISION,)]
+        return [self._row]
+
+    async def fetchone(self) -> tuple[str]:
+        return self._row
 
 
 class _FakeConnection:
@@ -166,7 +173,7 @@ class _FakeConnection:
         return None
 
     async def execute(self, query: str) -> _FakeCursor:
-        return _FakeCursor()
+        return _FakeCursor(query)
 
     async def close(self) -> None:
         return None
@@ -333,3 +340,34 @@ def test_database_at_another_revision_is_not_ready(
         assert asyncio.run(check()) is False
     assert "database schema is not at the expected revision" in caplog.text
     assert recorded == "" or recorded not in caplog.text
+
+
+@pytest.mark.parametrize("problems", ["superuser", "owns_relation,schema_create"])
+def test_unsafe_runtime_role_is_not_ready(
+    answering_database: FakePostgres, problems: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    answering_database.role_problems = problems
+    check = postgres_check(
+        _url(answering_database.port), timeout_seconds=2, expected_revision=REVISION
+    )
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(check()) is False
+    assert f"readiness: runtime database role is unsafe ({problems})" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
+def test_role_check_problems_outside_the_known_codes_are_not_logged(
+    answering_database: FakePostgres, caplog: pytest.LogCaptureFixture
+) -> None:
+    answering_database.role_problems = f"superuser,{PASSWORD}"
+    check = postgres_check(
+        _url(answering_database.port), timeout_seconds=2, expected_revision=REVISION
+    )
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(check()) is False
+    assert "runtime database role is unsafe (superuser,unknown)" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
+def test_the_role_check_query_carries_its_marker() -> None:
+    assert ROLE_CHECK.startswith(f"/* {ROLE_CHECK_MARKER} */")
