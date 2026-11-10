@@ -15,6 +15,8 @@ read past the tenant policy, which is enabled but not forced. It exposes only th
   revoked in this same transaction.
 """
 
+from typing import LiteralString
+
 from alembic import op
 from sqlalchemy import text
 
@@ -24,20 +26,21 @@ branch_labels = None
 depends_on = None
 
 
+# The schemas holding slack_workspaces and alembic_version. The comparisons between different
+# types name pg_catalog's operator, so no operator elsewhere on the search path can take over.
+SCHEMAS: LiteralString = """SELECT
+    (SELECT n.nspname FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('slack_workspaces')) AS workspaces,
+    (SELECT n.nspname FROM pg_catalog.pg_class c
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('alembic_version')) AS revision"""
+
+
 def _schema() -> str:
     """The schema holding slack_workspaces and alembic_version, quoted for use in DDL."""
     bind = op.get_bind()
-    schemas = bind.execute(
-        text(
-            """SELECT
-                   (SELECT n.nspname FROM pg_catalog.pg_class c
-                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                    WHERE c.oid = pg_catalog.to_regclass('slack_workspaces')),
-                   (SELECT n.nspname FROM pg_catalog.pg_class c
-                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                    WHERE c.oid = pg_catalog.to_regclass('alembic_version'))"""
-        )
-    ).one()
+    schemas = bind.execute(text(SCHEMAS)).one()
     workspaces, revision = schemas
     if workspaces is None or workspaces != revision:
         raise RuntimeError("slack_workspaces is not in the schema that alembic_version is in")

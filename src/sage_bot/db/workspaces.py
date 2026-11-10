@@ -24,7 +24,7 @@ import asyncio
 import math
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, LiteralString
 from uuid import UUID
 
 import psycopg
@@ -47,6 +47,16 @@ CONNECT_TIMEOUT_SECONDS = 10
 RESOLVE_TIMEOUT_SECONDS = 2.0
 # PostgreSQL's largest statement_timeout, in milliseconds.
 STATEMENT_TIMEOUT_MAX_MS = 2_147_483_647
+# Lowers the session's statement_timeout to %(limit)s milliseconds, never raising a lower
+# deployment value (0 means none; pg_settings reports milliseconds). Types and operators are
+# qualified, so objects elsewhere on the search path cannot stand in for them.
+STATEMENT_TIMEOUT: LiteralString = """SELECT pg_catalog.set_config('statement_timeout', CASE
+        WHEN s.setting::pg_catalog.int4 OPERATOR(pg_catalog.>) 0
+         AND s.setting::pg_catalog.int4
+             OPERATOR(pg_catalog.<=) %(limit)s::pg_catalog.int4
+        THEN s.setting ELSE %(limit)s::pg_catalog.text END, false)
+    FROM pg_catalog.pg_settings s
+    WHERE s.name OPERATOR(pg_catalog.=) 'statement_timeout'::pg_catalog.text"""
 
 
 @asynccontextmanager
@@ -217,20 +227,9 @@ async def _resolve(
     connection: psycopg.AsyncConnection[Any], team: str, remaining_seconds: float
 ) -> UUID | None:
     # A session setting rather than a connection option, which would replace any options the
-    # deployment put in DATABASE_URL. It only ever lowers the deployment's own limit (0 means
-    # none); pg_settings reports statement_timeout in milliseconds. Types and operators are
-    # qualified, so objects elsewhere on the search path cannot stand in for them.
+    # deployment put in DATABASE_URL.
     timeout_ms = min(max(1, math.ceil(remaining_seconds * 1000)), STATEMENT_TIMEOUT_MAX_MS)
-    await connection.execute(
-        """SELECT pg_catalog.set_config('statement_timeout', CASE
-               WHEN s.setting::pg_catalog.int4 OPERATOR(pg_catalog.>) 0
-                AND s.setting::pg_catalog.int4
-                    OPERATOR(pg_catalog.<=) %(limit)s::pg_catalog.int4
-               THEN s.setting ELSE %(limit)s::pg_catalog.text END, false)
-           FROM pg_catalog.pg_settings s
-           WHERE s.name OPERATOR(pg_catalog.=) 'statement_timeout'::pg_catalog.text""",
-        {"limit": timeout_ms},
-    )
+    await connection.execute(STATEMENT_TIMEOUT, {"limit": timeout_ms})
     # The cast selects the text signature exactly; readiness checks what it resolves to.
     cursor = await connection.execute(
         "SELECT resolve_slack_workspace(%s::pg_catalog.text)", (team,)
