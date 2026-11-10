@@ -107,7 +107,7 @@ WITH held AS (
 app AS (
     SELECT c.relnamespace AS schema_oid
     FROM pg_catalog.pg_class c
-    WHERE c.oid = pg_catalog.to_regclass('alembic_version')
+    WHERE c.oid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('alembic_version')
 ),
 schemas AS (
     SELECT n.oid AS schema_oid, n.nspowner
@@ -125,7 +125,7 @@ tables AS (
         (SELECT p.oid FROM pg_catalog.pg_proc p JOIN app ON p.pronamespace = app.schema_oid
          WHERE p.proname = 'resolve_slack_workspace' AND p.prokind = 'f'
            AND p.pronargs = 1
-           AND p.proargtypes[0] = 'pg_catalog.text'::pg_catalog.regtype) AS resolver,
+           AND p.proargtypes[0] OPERATOR(pg_catalog.=) 'pg_catalog.text'::pg_catalog.regtype) AS resolver,
         pg_catalog.current_setting('server_version_num')::int >= 170000 AS has_maintain
 ),
 acl_objects AS (
@@ -190,17 +190,17 @@ grants AS (
         -- The runtime allow-list, for held roles only. Never NULL, nor is NOT allowed.
         -- A grant option would let the runtime pass the privilege to roles of its choosing.
         NOT a.is_grantable AND COALESCE(
-            (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
+            (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
                 AND a.privilege_type = 'SELECT'
                 AND (o.object IS NOT DISTINCT FROM tables.revision
                      OR o.object IS NOT DISTINCT FROM tables.workspaces))
-            OR (o.catalog = 'pg_catalog.pg_proc'::pg_catalog.regclass
+            OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass
                 AND a.privilege_type = 'EXECUTE'
                 AND o.object IS NOT DISTINCT FROM tables.resolver)
-            OR (o.catalog = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+            OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass
                 AND a.privilege_type = 'USAGE'
                 AND o.object IN (SELECT schema_oid FROM app))
-            OR (o.catalog = 'pg_catalog.pg_database'::pg_catalog.regclass
+            OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_database'::pg_catalog.regclass
                 AND a.privilege_type IN ('CONNECT', 'TEMPORARY')),
             false
         ) AS allowed,
@@ -209,35 +209,35 @@ grants AS (
         -- grants USAGE on information_schema and SELECT on its views to PUBLIC without
         -- recording initial privileges; those views show only what the caller may already
         -- see. Its internal _pg_ relations (user mapping options among them) are not granted.
-        COALESCE((o.catalog = 'pg_catalog.pg_namespace'::pg_catalog.regclass
-            AND o.object = 'information_schema'::pg_catalog.regnamespace
+        COALESCE((o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_namespace'::pg_catalog.regclass
+            AND o.object OPERATOR(pg_catalog.=) 'information_schema'::pg_catalog.regnamespace
             AND a.privilege_type = 'USAGE')
-        OR (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
-            AND o.schema = 'information_schema'::pg_catalog.regnamespace
+        OR (o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
+            AND o.schema OPERATOR(pg_catalog.=) 'information_schema'::pg_catalog.regnamespace
             AND a.privilege_type = 'SELECT'
             AND NOT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_class c
                 WHERE c.oid = o.object AND pg_catalog.starts_with(c.relname, '_pg_')
             ))
-        OR CASE WHEN o.catalog = 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+        OR CASE WHEN o.catalog OPERATOR(pg_catalog.=) 'pg_catalog.pg_default_acl'::pg_catalog.regclass
                   OR NOT EXISTS (
                       SELECT 1 FROM pg_catalog.pg_init_privs i
-                      WHERE i.classoid = o.catalog AND i.objoid = o.object
+                      WHERE i.classoid OPERATOR(pg_catalog.=) o.catalog AND i.objoid = o.object
                         AND i.objsubid = o.subobject
                   )
             THEN EXISTS (
                 SELECT 1 FROM pg_catalog.aclexplode(pg_catalog.acldefault(o.kind, o.owner)) d
-                WHERE d.grantee = 0 AND d.privilege_type = a.privilege_type
+                WHERE d.grantee OPERATOR(pg_catalog.=) 0 AND d.privilege_type = a.privilege_type
             )
             ELSE EXISTS (
                 SELECT 1 FROM pg_catalog.pg_init_privs i, pg_catalog.aclexplode(i.initprivs) d
-                WHERE i.classoid = o.catalog AND i.objoid = o.object
+                WHERE i.classoid OPERATOR(pg_catalog.=) o.catalog AND i.objoid = o.object
                   AND i.objsubid = o.subobject
-                  AND d.grantee = 0 AND d.privilege_type = a.privilege_type
+                  AND d.grantee OPERATOR(pg_catalog.=) 0 AND d.privilege_type = a.privilege_type
             )
         END, false) AS initial
     FROM acl_objects o, tables, pg_catalog.aclexplode(o.acl) a
-    WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM held)
+    WHERE a.grantee OPERATOR(pg_catalog.=) 0 OR a.grantee IN (SELECT oid FROM held)
 ),
 writes AS (
     SELECT
@@ -282,13 +282,13 @@ SELECT pg_catalog.concat_ws(',',
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE pg_catalog.starts_with(rolname, 'pg_'))
         THEN 'predefined_role' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM grants WHERE grantee <> 0 AND NOT allowed
+        SELECT 1 FROM grants WHERE grantee OPERATOR(pg_catalog.<>) 0 AND NOT allowed
     ) THEN 'unexpected_privilege' END,
     CASE WHEN EXISTS (
         -- The runtime allow-list does not extend to PUBLIC: every role would hold it.
-        SELECT 1 FROM grants WHERE grantee = 0 AND NOT initial
+        SELECT 1 FROM grants WHERE grantee OPERATOR(pg_catalog.=) 0 AND NOT initial
     ) OR EXISTS (
-        SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser = 0
+        SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser OPERATOR(pg_catalog.=) 0
     ) THEN 'public_privilege' END,
     CASE WHEN EXISTS (
         SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser IN (SELECT oid FROM held)
@@ -347,7 +347,7 @@ SELECT pg_catalog.concat_ws(',',
         SELECT 1 FROM tables JOIN pg_catalog.pg_proc p ON p.oid = tables.resolver
         WHERE p.proacl IS NULL OR EXISTS (
             SELECT 1 FROM pg_catalog.aclexplode(p.proacl) a
-            WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE'
+            WHERE a.grantee OPERATOR(pg_catalog.=) 0 AND a.privilege_type = 'EXECUTE'
         )
     ) THEN 'public_executes_resolver' END
 )"""
@@ -365,7 +365,7 @@ WITH held AS (
 SELECT CASE WHEN EXISTS (
     SELECT 1
     FROM pg_catalog.pg_parameter_acl p, pg_catalog.aclexplode(p.paracl) a
-    WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM held)
+    WHERE a.grantee OPERATOR(pg_catalog.=) 0 OR a.grantee IN (SELECT oid FROM held)
 ) THEN 'parameter_grant' ELSE '' END"""
 PARAMETER_CHECK_MIN_SERVER_VERSION = 150000
 

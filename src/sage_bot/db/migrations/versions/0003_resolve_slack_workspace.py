@@ -9,7 +9,8 @@ read past the tenant policy, which is enabled but not forced. It exposes only th
 
 - Its body is a SQL-standard (`BEGIN ATOMIC`) body: PostgreSQL resolves the objects it names
   when the function is created, so a caller's search path cannot substitute them. The objects
-  are also schema-qualified, and its own search path is fixed to `pg_catalog, pg_temp`.
+  are also schema-qualified, as are the types in its signature, and its own search path is
+  fixed to `pg_catalog, pg_temp`.
 - No role can execute it until the deployment grants EXECUTE: the default PUBLIC grant is
   revoked in this same transaction.
 """
@@ -47,7 +48,8 @@ def upgrade() -> None:
     schema = _schema()
     # The only interpolated value is the schema name, quoted by the dialect.
     op.execute(
-        f"""CREATE FUNCTION {schema}.resolve_slack_workspace(team_id text) RETURNS uuid
+        f"""CREATE FUNCTION {schema}.resolve_slack_workspace(team_id pg_catalog.text)
+            RETURNS pg_catalog.uuid
             LANGUAGE sql STABLE STRICT SECURITY DEFINER
             SET search_path = pg_catalog, pg_temp
             BEGIN ATOMIC
@@ -56,8 +58,10 @@ def upgrade() -> None:
                   AND w.status OPERATOR(pg_catalog.=) 'enabled';
             END"""  # noqa: S608
     )
-    op.execute(f"REVOKE ALL ON FUNCTION {schema}.resolve_slack_workspace(text) FROM PUBLIC")
+    op.execute(
+        f"REVOKE ALL ON FUNCTION {schema}.resolve_slack_workspace(pg_catalog.text) FROM PUBLIC"
+    )
 
 
 def downgrade() -> None:
-    op.execute(f"DROP FUNCTION {_schema()}.resolve_slack_workspace(text)")
+    op.execute(f"DROP FUNCTION {_schema()}.resolve_slack_workspace(pg_catalog.text)")
