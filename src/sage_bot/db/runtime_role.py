@@ -34,9 +34,20 @@ PROBLEMS = (
     "server_files_or_programs",
     # It could terminate other sessions, including migrations.
     "signal_backend",
+    # It belongs to a predefined role (pg_monitor, pg_read_all_data, ...). Their powers are
+    # implicit rather than recorded as grants, so none is accepted.
+    "predefined_role",
+    # It, or a role it belongs to, holds a grant beyond the runtime allow-list: SELECT on
+    # alembic_version and slack_workspaces, USAGE on the application schema, and CONNECT or
+    # TEMPORARY on databases. This covers every object kind with grants, column grants, default
+    # privileges for future objects, and user mappings.
+    "unexpected_privilege",
     # It can run a superuser-only system function, such as reading server files, which
     # bypasses every permission check.
     "privileged_function",
+    # Everyone can read a catalog that is restricted by default, such as pg_statistic, which
+    # holds samples of every tenant's column values.
+    "public_catalog_access",
     # It was granted a server parameter (PostgreSQL 15+), which can load code or change how
     # the server enforces permissions.
     "parameter_grant",
@@ -129,18 +140,83 @@ SELECT pg_catalog.concat_ws(',',
     CASE WHEN EXISTS (
         SELECT 1 FROM pg_catalog.pg_proc f, held
         WHERE f.pronamespace = 'pg_catalog'::pg_catalog.regnamespace
-          AND (
-              -- Restricted by default: PUBLIC lacks EXECUTE, so a grant is deliberate.
-              (f.proacl IS NOT NULL
-               AND NOT pg_catalog.has_function_privilege('public', f.oid, 'EXECUTE'))
-              -- Server file and large object access, even if granted to PUBLIC.
-              OR f.proname IN (
-                  'pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'pg_stat_file',
-                  'lo_import', 'lo_export'
-              )
-          )
+          -- Restricted by default: PUBLIC lacks EXECUTE, so a grant is deliberate.
+          AND f.proacl IS NOT NULL
+          AND NOT pg_catalog.has_function_privilege('public', f.oid, 'EXECUTE')
           AND pg_catalog.has_function_privilege(held.oid, f.oid, 'EXECUTE')
+    ) OR EXISTS (
+        -- No system or extension function grants EXECUTE to PUBLIC explicitly by default.
+        SELECT 1 FROM pg_catalog.pg_proc f, pg_catalog.aclexplode(f.proacl) a
+        WHERE a.grantee = 0
+          AND (f.pronamespace = 'pg_catalog'::pg_catalog.regnamespace OR EXISTS (
+              SELECT 1 FROM pg_catalog.pg_depend d
+              WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                AND d.objid = f.oid
+                AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                AND d.deptype = 'e'
+          ))
     ) THEN 'privileged_function' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_catalog.unnest(ARRAY[
+            'pg_catalog.pg_authid', 'pg_catalog.pg_shadow', 'pg_catalog.pg_statistic',
+            'pg_catalog.pg_statistic_ext_data', 'pg_catalog.pg_user_mapping',
+            'pg_catalog.pg_largeobject'
+        ]) AS name
+        WHERE pg_catalog.has_table_privilege(
+            'public', pg_catalog.to_regclass(name), 'SELECT'
+        )
+    ) OR pg_catalog.has_column_privilege(
+        'public', 'pg_catalog.pg_subscription'::pg_catalog.regclass, 'subconninfo', 'SELECT'
+    ) THEN 'public_catalog_access' END,
+    CASE WHEN EXISTS (SELECT 1 FROM held WHERE pg_catalog.starts_with(rolname, 'pg_'))
+        THEN 'predefined_role' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_catalog.pg_class c, tables, pg_catalog.aclexplode(c.relacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+          AND NOT (
+              a.privilege_type = 'SELECT'
+              AND (c.oid IS NOT DISTINCT FROM tables.revision
+                   OR c.oid IS NOT DISTINCT FROM tables.workspaces)
+          )
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_attribute t, pg_catalog.aclexplode(t.attacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_proc f, pg_catalog.aclexplode(f.proacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+          AND NOT (a.privilege_type = 'USAGE' AND n.oid IN (SELECT schema_oid FROM app))
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+          AND a.privilege_type NOT IN ('CONNECT', 'TEMPORARY')
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_type t, pg_catalog.aclexplode(t.typacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_language l, pg_catalog.aclexplode(l.lanacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_foreign_data_wrapper w, pg_catalog.aclexplode(w.fdwacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_foreign_server v, pg_catalog.aclexplode(v.srvacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_largeobject_metadata m, pg_catalog.aclexplode(m.lomacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_tablespace s, pg_catalog.aclexplode(s.spcacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_default_acl d, pg_catalog.aclexplode(d.defaclacl) a
+        WHERE a.grantee IN (SELECT oid FROM held)
+        UNION ALL
+        SELECT 1 FROM pg_catalog.pg_user_mappings m
+        WHERE m.umuser IN (SELECT oid FROM held)
+    ) THEN 'unexpected_privilege' END,
     CASE WHEN EXISTS (SELECT 1 FROM schemas JOIN held ON held.oid = schemas.nspowner)
         THEN 'owns_schema' END,
     CASE WHEN EXISTS (

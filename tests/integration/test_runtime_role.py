@@ -279,6 +279,80 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         lambda db: _admin(db, "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC"),
         "privileged_function",
     ),
+    "runs an extension function restricted by default": (
+        lambda db: _admin(
+            db,
+            "CREATE EXTENSION dblink; "
+            "GRANT EXECUTE ON FUNCTION dblink_connect_u(text, text) TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "everyone runs an extension function restricted by default": (
+        lambda db: _admin(
+            db,
+            "CREATE EXTENSION dblink; "
+            "GRANT EXECUTE ON FUNCTION dblink_connect_u(text, text) TO PUBLIC",
+        ),
+        "privileged_function",
+    ),
+    "reads column statistics": (
+        lambda db: _admin(
+            db, "GRANT SELECT ON pg_catalog.pg_statistic TO {rt}", rt=db.runtime_role
+        ),
+        "unexpected_privilege",
+    ),
+    "everyone reads column statistics": (
+        lambda db: _admin(db, "GRANT SELECT ON pg_catalog.pg_statistic TO PUBLIC"),
+        "public_catalog_access",
+    ),
+    "reads another table": (
+        lambda db: _admin(
+            db,
+            "CREATE TABLE public.extra (id int); GRANT SELECT ON public.extra TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "a column grant": (
+        lambda db: _admin(
+            db, "GRANT SELECT (slack_team_id) ON slack_workspaces TO {rt}", rt=db.runtime_role
+        ),
+        "unexpected_privilege",
+    ),
+    "uses another schema": (
+        lambda db: _admin(
+            db, "CREATE SCHEMA extra; GRANT USAGE ON SCHEMA extra TO {rt}", rt=db.runtime_role
+        ),
+        "unexpected_privilege",
+    ),
+    "default privileges for future tables": (
+        lambda db: _admin(
+            db,
+            "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} GRANT INSERT ON TABLES TO {rt}",
+            owner=db.owner_role,
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "a user mapping": (
+        lambda db: _admin(
+            db,
+            "CREATE EXTENSION postgres_fdw; "
+            "CREATE SERVER extra FOREIGN DATA WRAPPER postgres_fdw; "
+            "CREATE USER MAPPING FOR {rt} SERVER extra",
+            rt=db.runtime_role,
+        ),
+        "unexpected_privilege",
+    ),
+    "monitoring role": (
+        lambda db: _admin(db, "GRANT pg_monitor TO {rt}", rt=db.runtime_role),
+        "predefined_role",
+    ),
+    "reads all data": (
+        lambda db: _admin(db, "GRANT pg_read_all_data TO {rt}", rt=db.runtime_role),
+        "predefined_role",
+    ),
     "owns a function": (
         lambda db: _admin(
             db,

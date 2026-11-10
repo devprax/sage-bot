@@ -50,20 +50,20 @@ Then, as `sage_owner`, after each `sage-bot-migrate` (the statement is idempoten
 GRANT SELECT ON alembic_version, slack_workspaces TO sage_runtime;
 ```
 
-Readiness verifies the runtime role on every probe, from its effective privileges rather than its name, and reports `503` if it:
+Readiness verifies the runtime role on every probe, from its effective privileges rather than its name. The privileges of every role it belongs to count too, whether that membership confers them by inheritance, by `SET ROLE` or by `ADMIN`. Readiness reports `503` if the role:
 
 - runs as a role other than its login role, for example through a default `SET ROLE`;
-- is, or belongs to, a role with superuser, `BYPASSRLS`, `REPLICATION`, `CREATEROLE` or `CREATEDB`, or one of the predefined roles `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files` or `pg_signal_backend`. Membership counts whether it confers privileges by inheritance, by `SET ROLE` or by `ADMIN`, and the privilege checks below apply to every role it belongs to;
-- owns, or belongs to a role that owns, the application schema or a schema on its search path, or any table, function or type in them. This includes the database owner, which owns `public`;
-- can create objects in those schemas or in the database, including through grants to `PUBLIC`;
-- can run a system function that is restricted by default, such as `pg_read_binary_file` or `lo_import`, or a server file or large object function even if it was granted to `PUBLIC`;
-- holds, directly or through `PUBLIC`, a grant on a server parameter (`GRANT SET` or `GRANT ALTER SYSTEM ON PARAMETER`, PostgreSQL 15 and later);
-- holds any privilege other than `SELECT` on `alembic_version` or `slack_workspaces`, including column-level grants and, on PostgreSQL 17, `MAINTAIN`;
+- has, directly or through a role it belongs to, superuser, `BYPASSRLS`, `REPLICATION`, `CREATEROLE` or `CREATEDB`;
+- belongs to any predefined `pg_` role, such as `pg_monitor`, `pg_read_all_data` or `pg_execute_server_program`, whose powers are not recorded as grants;
+- owns the application schema, a schema on its search path, or any table, function or type in them. This includes the database owner, which owns `public`;
+- holds any grant beyond an allow-list. The allow-list is `SELECT` on `alembic_version` and `slack_workspaces`, `USAGE` on the application schema, and `CONNECT` or `TEMPORARY` on databases. Grants checked include those on tables, columns, functions, schemas, databases, types, languages, foreign servers, large objects and tablespaces, plus default privileges for future objects and user mappings. On PostgreSQL 17, `MAINTAIN` counts too;
+- can create objects in those schemas or in the database, or run a system function that is restricted by default, such as `pg_read_binary_file`, `lo_import` or `dblink_connect_u`;
+- benefits from what the deployment granted to `PUBLIC`: `CREATE` on those schemas, explicit `EXECUTE` on a system or extension function, read access to a restricted catalog such as `pg_statistic` or `pg_authid`, or (PostgreSQL 15 and later) a grant on a server parameter;
 - cannot read `slack_workspaces`, or that table has row-level security disabled.
 
 Before PostgreSQL 15, `PUBLIC` can create objects in `public` by default, so readiness reports `503` until the deployment runs `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
 
-The check covers the runtime role's own privileges. It does not audit what the trusted owner grants or defines, such as additional row-level security policies, views or `SECURITY DEFINER` functions that expose rows, or default privileges for future tables. Functions the owner defines must revoke `EXECUTE` from `PUBLIC` unless every role may run them.
+The check covers the runtime role's own privileges. It does not audit what the trusted owner grants or defines, such as additional row-level security policies, or views and `SECURITY DEFINER` functions that expose rows. Functions the owner defines must revoke `EXECUTE` from `PUBLIC` unless every role may run them.
 
 The problem is logged as a fixed code, such as `owns_relation`, without role names or connection values. Liveness is unaffected.
 
