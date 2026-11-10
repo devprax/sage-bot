@@ -1,8 +1,9 @@
 """A minimal PostgreSQL wire-protocol server for readiness tests.
 
 It completes the startup handshake (no TLS, no password) and then either answers every query
-or stalls without replying, which lets tests reproduce a database that accepts a query and
-stops responding. It counts open client connections and cancel requests.
+with one text row holding `revision` (as `SELECT version_num FROM alembic_version` would), or
+stalls without replying, which lets tests reproduce a database that accepts a query and stops
+responding. It counts open client connections and cancel requests.
 """
 
 import socket
@@ -30,6 +31,12 @@ def _message(kind: bytes, body: bytes = b"") -> bytes:
     return kind + struct.pack("!I", len(body) + 4) + body
 
 
+# One text column named version_num (type oid 25, variable length, text format).
+_ROW_DESCRIPTION = _message(
+    b"T", struct.pack("!H", 1) + b"version_num\0" + struct.pack("!IhIhih", 0, 0, 25, -1, -1, 0)
+)
+
+
 def _read_exact(connection: socket.socket, size: int) -> bytes:
     data = b""
     while len(data) < size:
@@ -43,6 +50,7 @@ def _read_exact(connection: socket.socket, size: int) -> bytes:
 class FakePostgres:
     def __init__(self) -> None:
         self.stall = True
+        self.revision = "0001"
         self.cancel_requests = 0
         self._open = 0
         self._lock = threading.Lock()
@@ -129,13 +137,22 @@ class FakePostgres:
             elif kind == b"B":
                 connection.sendall(_message(b"2"))  # BindComplete
             elif kind == b"D":
-                connection.sendall(_message(b"n"))  # NoData
+                connection.sendall(_ROW_DESCRIPTION)
             elif kind == b"E":
-                connection.sendall(_message(b"C", b"SELECT 1\0"))
+                connection.sendall(self._row() + _message(b"C", b"SELECT 1\0"))
             elif kind == b"S":
                 connection.sendall(_message(b"Z", b"I"))
             elif kind == b"Q":
-                connection.sendall(_message(b"C", b"SELECT 1\0") + _message(b"Z", b"I"))
+                connection.sendall(
+                    _ROW_DESCRIPTION
+                    + self._row()
+                    + _message(b"C", b"SELECT 1\0")
+                    + _message(b"Z", b"I")
+                )
+
+    def _row(self) -> bytes:
+        value = self.revision.encode()
+        return _message(b"D", struct.pack("!HI", 1, len(value)) + value)  # DataRow
 
     def start(self) -> None:
         self._thread.start()

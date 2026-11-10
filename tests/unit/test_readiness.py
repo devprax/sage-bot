@@ -22,6 +22,7 @@ from sage_bot.api.readiness import (
 # Synthetic credentials only; nothing here reaches a real database.
 PASSWORD = "readiness-test-password"  # noqa: S105
 ENCRYPTION_KEY = base64.b64encode(bytes(range(32))).decode()
+REVISION = "0001"
 SETTINGS_VARIABLES = {
     "SAGE_ENV",
     "DATABASE_URL",
@@ -103,13 +104,18 @@ def test_unreachable_database_is_not_ready(
     refused_port: int, caplog: pytest.LogCaptureFixture
 ) -> None:
     with caplog.at_level(logging.WARNING):
-        assert asyncio.run(postgres_check(_url(refused_port), timeout_seconds=2)()) is False
+        assert (
+            asyncio.run(
+                postgres_check(_url(refused_port), timeout_seconds=2, expected_revision=REVISION)()
+            )
+            is False
+        )
     assert "database check failed" in caplog.text
     assert PASSWORD not in caplog.text
 
 
 def test_unresponsive_database_is_not_ready_within_the_timeout(silent_port: int) -> None:
-    check = postgres_check(_url(silent_port), timeout_seconds=0.5)
+    check = postgres_check(_url(silent_port), timeout_seconds=0.5, expected_revision=REVISION)
     started = time.monotonic()
     # The outer bound turns a missing timeout into a failure instead of a hung test.
     assert asyncio.run(asyncio.wait_for(check(), timeout=5)) is False
@@ -147,6 +153,11 @@ def test_valid_settings_check_the_configured_database(
     assert response.status_code == 503
 
 
+class _FakeCursor:
+    async def fetchall(self) -> list[tuple[str]]:
+        return [(REVISION,)]
+
+
 class _FakeConnection:
     async def __aenter__(self) -> "_FakeConnection":
         return self
@@ -154,8 +165,8 @@ class _FakeConnection:
     async def __aexit__(self, *exc: object) -> None:
         return None
 
-    async def execute(self, query: str) -> None:
-        return None
+    async def execute(self, query: str) -> _FakeCursor:
+        return _FakeCursor()
 
     async def close(self) -> None:
         return None
@@ -170,7 +181,7 @@ def test_concurrent_probes_share_one_database_check(monkeypatch: pytest.MonkeyPa
         return _FakeConnection()
 
     monkeypatch.setattr("psycopg.AsyncConnection.connect", slow_connect)
-    check = postgres_check(_url(5432), timeout_seconds=2)
+    check = postgres_check(_url(5432), timeout_seconds=2, expected_revision=REVISION)
 
     async def flood() -> list[bool]:
         return await asyncio.gather(*(check() for _ in range(50)))
@@ -194,7 +205,10 @@ def test_only_the_error_type_is_logged(
 
     monkeypatch.setattr("psycopg.AsyncConnection.connect", failing_connect)
     with caplog.at_level(logging.WARNING):
-        assert asyncio.run(postgres_check(_url(5432), timeout_seconds=1)()) is False
+        assert (
+            asyncio.run(postgres_check(_url(5432), timeout_seconds=1, expected_revision=REVISION)())
+            is False
+        )
     assert "database check failed (ConnectionError)" in caplog.text
     assert secret not in caplog.text
     assert PASSWORD not in caplog.text
@@ -208,7 +222,7 @@ def test_a_probe_left_on_a_closed_event_loop_is_not_reused(
         return _FakeConnection()
 
     monkeypatch.setattr("psycopg.AsyncConnection.connect", slow_connect)
-    check = postgres_check(_url(5432), timeout_seconds=2)
+    check = postgres_check(_url(5432), timeout_seconds=2, expected_revision=REVISION)
 
     first = asyncio.new_event_loop()
     try:
@@ -233,7 +247,9 @@ def _probe_tasks() -> list[asyncio.Task[object]]:
 
 
 def test_a_stalled_probe_leaves_no_task_behind(stalling_database: FakePostgres) -> None:
-    check = postgres_check(_url(stalling_database.port), timeout_seconds=0.3)
+    check = postgres_check(
+        _url(stalling_database.port), timeout_seconds=0.3, expected_revision=REVISION
+    )
 
     async def probe_and_count() -> tuple[bool, int]:
         before = asyncio.all_tasks()
@@ -253,7 +269,9 @@ def test_query_stalled_after_the_handshake_is_bounded_and_recovers(
     stalling_database: FakePostgres, caplog: pytest.LogCaptureFixture
 ) -> None:
     timeout = 0.5
-    check = postgres_check(_url(stalling_database.port), timeout_seconds=timeout)
+    check = postgres_check(
+        _url(stalling_database.port), timeout_seconds=timeout, expected_revision=REVISION
+    )
     leftover_tasks: list[int] = []
 
     async def counted_check() -> bool:
@@ -287,3 +305,31 @@ def test_query_stalled_after_the_handshake_is_bounded_and_recovers(
     assert recovered.status_code == 200
     assert recovered.json() == {"status": "ok"}
     assert stalling_database.wait_until_closed(timeout=1.0)
+
+
+@pytest.fixture
+def answering_database() -> Iterator[FakePostgres]:
+    with fake_postgres() as server:
+        server.stall = False
+        yield server
+
+
+def test_database_at_the_expected_revision_is_ready(answering_database: FakePostgres) -> None:
+    check = postgres_check(
+        _url(answering_database.port), timeout_seconds=2, expected_revision=REVISION
+    )
+    assert asyncio.run(check()) is True
+
+
+@pytest.mark.parametrize("recorded", ["0000", "ffffffffffff", ""])
+def test_database_at_another_revision_is_not_ready(
+    answering_database: FakePostgres, recorded: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    answering_database.revision = recorded
+    check = postgres_check(
+        _url(answering_database.port), timeout_seconds=2, expected_revision=REVISION
+    )
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(check()) is False
+    assert "database schema is not at the expected revision" in caplog.text
+    assert recorded == "" or recorded not in caplog.text
