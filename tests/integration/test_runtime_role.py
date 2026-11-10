@@ -213,6 +213,47 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
         ),
         "owns_relation",
     ),
+    "executes server programs": (
+        lambda db: _admin(db, "GRANT pg_execute_server_program TO {rt}", rt=db.runtime_role),
+        "server_files_or_programs",
+    ),
+    "reads server files": (
+        lambda db: _admin(db, "GRANT pg_read_server_files TO {rt}", rt=db.runtime_role),
+        "server_files_or_programs",
+    ),
+    "writes server files": (
+        lambda db: _admin(db, "GRANT pg_write_server_files TO {rt}", rt=db.runtime_role),
+        "server_files_or_programs",
+    ),
+    "signals backends": (
+        lambda db: _admin(db, "GRANT pg_signal_backend TO {rt}", rt=db.runtime_role),
+        "signal_backend",
+    ),
+    "maintains every table": (
+        lambda db: _admin(db, "GRANT pg_maintain TO {rt}", rt=db.runtime_role),
+        "writes_workspaces",
+    ),
+    "maintains workspaces": (
+        lambda db: _admin(db, "GRANT MAINTAIN ON slack_workspaces TO {rt}", rt=db.runtime_role),
+        "writes_workspaces",
+    ),
+    "maintains the schema revision": (
+        lambda db: _admin(db, "GRANT MAINTAIN ON alembic_version TO {rt}", rt=db.runtime_role),
+        "writes_schema_revision",
+    ),
+    "owns a function": (
+        lambda db: _admin(
+            db,
+            "CREATE FUNCTION public.extra() RETURNS int LANGUAGE sql AS 'SELECT 1'; "
+            "ALTER FUNCTION public.extra() OWNER TO {rt}",
+            rt=db.runtime_role,
+        ),
+        "owns_function_or_type",
+    ),
+    "owns a schema on its search path": (
+        lambda db: _admin(db, "CREATE SCHEMA {rt} AUTHORIZATION {rt}", rt=db.runtime_role),
+        "owns_schema",
+    ),
     "owns a relation": (
         lambda db: _admin(
             db,
@@ -302,6 +343,30 @@ def test_membership_in_a_bypassrls_role_is_unsafe(
         assert "bypassrls" in caplog.text
     finally:
         _admin(migrated, "DROP ROLE {role}", role=privileged)
+
+
+def test_a_default_set_role_does_not_hide_the_login_roles_memberships(
+    migrated: TenantDatabase, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A login role that switches to a weaker role by default can still switch to the owner."""
+    weaker = f"{migrated.runtime_role}_w"
+    _admin(migrated, "CREATE ROLE {role} NOLOGIN", role=weaker)
+    try:
+        _admin(migrated, "GRANT SELECT ON alembic_version, slack_workspaces TO {role}", role=weaker)
+        _admin(migrated, "GRANT {role} TO {rt}", role=weaker, rt=migrated.runtime_role)
+        _admin(
+            migrated, "GRANT {owner} TO {rt}", owner=migrated.owner_role, rt=migrated.runtime_role
+        )
+        _admin(migrated, "ALTER ROLE {rt} SET role = {role}", rt=migrated.runtime_role, role=weaker)
+        with caplog.at_level(logging.WARNING):
+            assert _ready(migrated.runtime_url) is False
+        codes = caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
+        assert "session_role_differs" in codes
+        assert "owns_relation" in codes
+    finally:
+        _admin(migrated, "ALTER ROLE {rt} RESET role", rt=migrated.runtime_role)
+        _admin(migrated, "DROP OWNED BY {role}", role=weaker)
+        _admin(migrated, "DROP ROLE {role}", role=weaker)
 
 
 @pytest.mark.parametrize("credentials", ["owner", "superuser"])

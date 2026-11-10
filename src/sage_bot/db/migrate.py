@@ -2,8 +2,8 @@
 
 Run `sage-bot-migrate` or `python -m sage_bot.db.migrate` as an explicit deployment step, with
 `MIGRATION_DATABASE_URL` set to the role that owns the schema; the server never migrates on
-startup and never receives these credentials. Readiness reports not ready until the recorded revision
-matches `expected_revision()`.
+startup and never receives these credentials. Readiness reports not ready until the recorded
+revision matches `expected_revision()`.
 """
 
 import argparse

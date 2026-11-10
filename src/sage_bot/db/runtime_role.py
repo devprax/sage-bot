@@ -3,8 +3,8 @@
 Row-level security protects tenants only against a role that cannot bypass or change it. The
 check evaluates the connected role's effective privileges, never its name:
 
-- Role attributes and ownership count through every role it belongs to, whether it inherits
-  their privileges or can `SET ROLE` to them.
+- Role attributes and ownership count through every role the login role or the current role
+  belongs to, whether it inherits their privileges or can `SET ROLE` to them.
 - Schema and table privileges are read from the catalog, including grants to `PUBLIC`, rather
   than assumed from PostgreSQL's defaults.
 
@@ -17,19 +17,29 @@ from typing import LiteralString
 ROLE_CHECK_MARKER = "sage-bot runtime role check"
 
 PROBLEMS = (
+    # The session switched to another role (for example a role's default `SET ROLE`), so the
+    # privileges in effect are not those of the login role it can switch back to.
+    "session_role_differs",
     # A role it belongs to can bypass row-level security or every permission check.
     "superuser",
     "bypassrls",
     # Before PostgreSQL 16, CREATEROLE can grant membership in any non-superuser role,
     # including the schema owner.
     "createrole",
-    # An owner can disable or replace policies and alter or drop tables.
+    # Server programs and files reach the database's data outside any permission check.
+    "server_files_or_programs",
+    # It could terminate other sessions, including migrations.
+    "signal_backend",
+    # An owner can disable or replace policies, alter or drop tables, or replace code that
+    # other roles run. The schemas checked are the application schema and the search path.
     "owns_schema",
     "owns_relation",
+    "owns_function_or_type",
     # New objects could shadow the application's tables or run code as other roles.
     "schema_create",
     "database_create",
-    # It could change the recorded schema revision, or provision and remove workspaces.
+    # It could change the recorded schema revision, provision or remove workspaces, or lock
+    # the tables (PostgreSQL 17 MAINTAIN).
     "writes_schema_revision",
     "writes_workspaces",
     # It could not perform tenant-scoped workspace reads.
@@ -37,49 +47,83 @@ PROBLEMS = (
     "workspaces_without_row_security",
 )
 
-# The application schema is the one holding `alembic_version`. Privilege functions take
-# regclass OIDs, which are NULL for a missing table instead of an error. Column-level grants
-# count as writes too: has_any_column_privilege includes them, has_table_privilege does not.
+# Roles count by membership, of the login (session) role or the current role, whether they
+# confer privileges by inheritance or by `SET ROLE`. The application schema is the one holding
+# `alembic_version`, and both tables are resolved in it rather than through the search path.
+# Column-level grants count as writes: has_any_column_privilege includes them.
 ROLE_CHECK: LiteralString = """/* sage-bot runtime role check */
 WITH held AS (
-    SELECT r.oid, r.rolsuper, r.rolbypassrls, r.rolcreaterole
+    SELECT r.oid, r.rolname, r.rolsuper, r.rolbypassrls, r.rolcreaterole
     FROM pg_catalog.pg_roles r
-    WHERE pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER')
+    WHERE pg_catalog.pg_has_role(session_user, r.oid, 'MEMBER')
+       OR pg_catalog.pg_has_role(current_user, r.oid, 'MEMBER')
 ),
 app AS (
     SELECT c.relnamespace AS schema_oid
     FROM pg_catalog.pg_class c
     WHERE c.oid = pg_catalog.to_regclass('alembic_version')
 ),
+schemas AS (
+    SELECT n.oid AS schema_oid, n.nspowner
+    FROM pg_catalog.pg_namespace n
+    WHERE n.nspname = ANY (pg_catalog.current_schemas(false))
+       OR n.oid IN (SELECT schema_oid FROM app)
+),
 tables AS (
-    SELECT pg_catalog.to_regclass('alembic_version') AS revision,
-           pg_catalog.to_regclass('slack_workspaces') AS workspaces
+    SELECT
+        (SELECT c.oid FROM pg_catalog.pg_class c JOIN app ON c.relnamespace = app.schema_oid
+         WHERE c.relname = 'alembic_version') AS revision,
+        (SELECT c.oid FROM pg_catalog.pg_class c JOIN app ON c.relnamespace = app.schema_oid
+         WHERE c.relname = 'slack_workspaces') AS workspaces,
+        pg_catalog.current_setting('server_version_num')::int >= 170000 AS has_maintain
+),
+writes AS (
+    SELECT
+        pg_catalog.has_table_privilege(revision, 'DELETE, TRUNCATE, TRIGGER')
+            OR pg_catalog.has_any_column_privilege(revision, 'INSERT, UPDATE, REFERENCES')
+            OR CASE WHEN has_maintain
+                THEN pg_catalog.has_table_privilege(revision, 'MAINTAIN') END AS revision,
+        pg_catalog.has_table_privilege(workspaces, 'DELETE, TRUNCATE, TRIGGER')
+            OR pg_catalog.has_any_column_privilege(workspaces, 'INSERT, UPDATE, REFERENCES')
+            OR CASE WHEN has_maintain
+                THEN pg_catalog.has_table_privilege(workspaces, 'MAINTAIN') END AS workspaces
+    FROM tables
 )
 SELECT pg_catalog.concat_ws(',',
+    CASE WHEN current_user <> session_user THEN 'session_role_differs' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolsuper) THEN 'superuser' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolbypassrls) THEN 'bypassrls' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolcreaterole) THEN 'createrole' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM app
-        JOIN pg_catalog.pg_namespace n ON n.oid = app.schema_oid
-        JOIN held ON held.oid = n.nspowner
-    ) THEN 'owns_schema' END,
+        SELECT 1 FROM held WHERE rolname IN (
+            'pg_execute_server_program', 'pg_read_server_files', 'pg_write_server_files'
+        )
+    ) THEN 'server_files_or_programs' END,
+    CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolname = 'pg_signal_backend')
+        THEN 'signal_backend' END,
+    CASE WHEN EXISTS (SELECT 1 FROM schemas JOIN held ON held.oid = schemas.nspowner)
+        THEN 'owns_schema' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM app
-        JOIN pg_catalog.pg_class c ON c.relnamespace = app.schema_oid
+        SELECT 1 FROM pg_catalog.pg_class c
+        JOIN schemas ON c.relnamespace = schemas.schema_oid
         JOIN held ON held.oid = c.relowner
     ) THEN 'owns_relation' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM app WHERE pg_catalog.has_schema_privilege(app.schema_oid, 'CREATE')
+        SELECT 1 FROM pg_catalog.pg_proc f
+        JOIN schemas ON f.pronamespace = schemas.schema_oid
+        JOIN held ON held.oid = f.proowner
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_type t
+        JOIN schemas ON t.typnamespace = schemas.schema_oid
+        JOIN held ON held.oid = t.typowner
+    ) THEN 'owns_function_or_type' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM schemas WHERE pg_catalog.has_schema_privilege(schemas.schema_oid, 'CREATE')
     ) THEN 'schema_create' END,
     CASE WHEN pg_catalog.has_database_privilege(pg_catalog.current_database(), 'CREATE')
         THEN 'database_create' END,
-    CASE WHEN (SELECT pg_catalog.has_table_privilege(revision, 'DELETE, TRUNCATE, TRIGGER')
-        OR pg_catalog.has_any_column_privilege(revision, 'INSERT, UPDATE, REFERENCES') FROM tables)
-        THEN 'writes_schema_revision' END,
-    CASE WHEN (SELECT pg_catalog.has_table_privilege(workspaces, 'DELETE, TRUNCATE, TRIGGER')
-        OR pg_catalog.has_any_column_privilege(workspaces, 'INSERT, UPDATE, REFERENCES') FROM tables)
-        THEN 'writes_workspaces' END,
+    CASE WHEN (SELECT revision FROM writes) THEN 'writes_schema_revision' END,
+    CASE WHEN (SELECT workspaces FROM writes) THEN 'writes_workspaces' END,
     CASE WHEN (SELECT pg_catalog.has_table_privilege(workspaces, 'SELECT') FROM tables)
         IS NOT TRUE THEN 'cannot_read_workspaces' END,
     CASE WHEN (

@@ -1,10 +1,10 @@
 """A minimal PostgreSQL wire-protocol server for readiness tests.
 
 It completes the startup handshake (no TLS, no password) and then either answers each query
-with one text row, or stalls without replying, which lets tests reproduce a database that accepts a query and stops
-responding. The runtime role check gets `role_problems` (empty: a safe role); any other query
-gets `revision`, as `SELECT version_num FROM alembic_version` would. It counts open client
-connections and cancel requests.
+with one text row, or stalls without replying, which lets tests reproduce a database that
+accepts a query and stops responding. The runtime role check gets `role_problems` (empty: a
+safe role); any other query gets `revision`, as `SELECT version_num FROM alembic_version`
+would. It counts open client connections and cancel requests.
 """
 
 import socket

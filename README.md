@@ -52,11 +52,16 @@ GRANT SELECT ON alembic_version, slack_workspaces TO sage_runtime;
 
 Readiness verifies the runtime role on every probe, from its effective privileges rather than its name, and reports `503` if it:
 
-- is, or belongs to, a role with superuser, `BYPASSRLS` or `CREATEROLE`; membership counts whether the role inherits privileges or can `SET ROLE`;
-- owns, or belongs to a role that owns, the application schema or any relation in it; this includes the database owner, which owns `public`;
-- can create objects in that schema or in the database, including through grants to `PUBLIC`;
-- holds any privilege other than `SELECT` on `alembic_version` or `slack_workspaces`, including column-level grants;
+- runs as a role other than its login role, for example through a default `SET ROLE`;
+- is, or belongs to, a role with superuser, `BYPASSRLS` or `CREATEROLE`, or one of the predefined roles `pg_execute_server_program`, `pg_read_server_files`, `pg_write_server_files` or `pg_signal_backend`. Membership counts whether it confers privileges by inheritance or by `SET ROLE`;
+- owns, or belongs to a role that owns, the application schema or a schema on its search path, or any table, function or type in them. This includes the database owner, which owns `public`;
+- can create objects in those schemas or in the database, including through grants to `PUBLIC`;
+- holds any privilege other than `SELECT` on `alembic_version` or `slack_workspaces`, including column-level grants and, on PostgreSQL 17, `MAINTAIN`;
 - cannot read `slack_workspaces`, or that table has row-level security disabled.
+
+Before PostgreSQL 15, `PUBLIC` can create objects in `public` by default, so readiness reports `503` until the deployment runs `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
+
+The check covers the runtime role's own privileges. It does not audit what the trusted owner grants or defines, such as additional row-level security policies, views or `SECURITY DEFINER` functions that expose rows, or default privileges for future tables. Functions the owner defines must revoke `EXECUTE` from `PUBLIC` unless every role may run them.
 
 The problem is logged as a fixed code, such as `owns_relation`, without role names or connection values. Liveness is unaffected.
 
