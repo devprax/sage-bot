@@ -267,17 +267,17 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
             "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_binary_file(text) TO {rt}",
             rt=db.runtime_role,
         ),
-        "privileged_function",
+        "unexpected_privilege",
     ),
     "imports server files as large objects": (
         lambda db: _admin(
             db, "GRANT EXECUTE ON FUNCTION pg_catalog.lo_import(text) TO {rt}", rt=db.runtime_role
         ),
-        "privileged_function",
+        "unexpected_privilege",
     ),
     "everyone reads server files": (
         lambda db: _admin(db, "GRANT EXECUTE ON FUNCTION pg_catalog.pg_read_file(text) TO PUBLIC"),
-        "privileged_function",
+        "public_privilege",
     ),
     "runs an extension function restricted by default": (
         lambda db: _admin(
@@ -294,7 +294,7 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
             "CREATE EXTENSION dblink; "
             "GRANT EXECUTE ON FUNCTION dblink_connect_u(text, text) TO PUBLIC",
         ),
-        "privileged_function",
+        "public_privilege",
     ),
     "reads column statistics": (
         lambda db: _admin(
@@ -304,7 +304,7 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
     ),
     "everyone reads column statistics": (
         lambda db: _admin(db, "GRANT SELECT ON pg_catalog.pg_statistic TO PUBLIC"),
-        "public_catalog_access",
+        "public_privilege",
     ),
     "reads another table": (
         lambda db: _admin(
@@ -344,6 +344,32 @@ UNSAFE_CHANGES: dict[str, tuple[Change, str]] = {
             rt=db.runtime_role,
         ),
         "unexpected_privilege",
+    ),
+    "everyone uses a foreign server": (
+        lambda db: _admin(
+            db,
+            "CREATE EXTENSION postgres_fdw; "
+            "CREATE SERVER extra FOREIGN DATA WRAPPER postgres_fdw; "
+            "GRANT USAGE ON FOREIGN SERVER extra TO PUBLIC",
+        ),
+        "public_privilege",
+    ),
+    "a user mapping for everyone": (
+        lambda db: _admin(
+            db,
+            "CREATE EXTENSION postgres_fdw; "
+            "CREATE SERVER extra FOREIGN DATA WRAPPER postgres_fdw; "
+            "CREATE USER MAPPING FOR PUBLIC SERVER extra",
+        ),
+        "public_privilege",
+    ),
+    "everyone uses a foreign data wrapper": (
+        lambda db: _admin(
+            db,
+            "CREATE EXTENSION postgres_fdw; "
+            "GRANT USAGE ON FOREIGN DATA WRAPPER postgres_fdw TO PUBLIC",
+        ),
+        "public_privilege",
     ),
     "monitoring role": (
         lambda db: _admin(db, "GRANT pg_monitor TO {rt}", rt=db.runtime_role),
@@ -558,6 +584,30 @@ def test_a_default_set_role_does_not_hide_the_login_roles_memberships(
         _admin(migrated, "ALTER ROLE {rt} RESET role", rt=migrated.runtime_role)
         _admin(migrated, "DROP OWNED BY {role}", role=weaker)
         _admin(migrated, "DROP ROLE {role}", role=weaker)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # Expands the function's default ACL, making PUBLIC's default EXECUTE explicit.
+        "GRANT EXECUTE ON FUNCTION pg_catalog.gen_random_uuid() TO {owner}",
+        "GRANT EXECUTE ON FUNCTION pg_catalog.gen_random_uuid() TO {owner}; "
+        "REVOKE EXECUTE ON FUNCTION pg_catalog.gen_random_uuid() FROM {owner}",
+        # The same for an ordinary extension function.
+        "CREATE EXTENSION pgcrypto; GRANT EXECUTE ON FUNCTION digest(text, text) TO {owner}",
+        # Default privileges that keep PUBLIC's default EXECUTE on future functions.
+        "ALTER DEFAULT PRIVILEGES FOR ROLE {owner} GRANT EXECUTE ON FUNCTIONS TO {owner}",
+    ],
+    ids=["system-function", "granted-and-revoked", "extension-function", "default-privileges"],
+)
+def test_public_defaults_made_explicit_are_not_flagged(
+    migrated: TenantDatabase, statement: LiteralString, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Grants to other roles can spell out PUBLIC's defaults; that is not a PUBLIC grant."""
+    _admin(migrated, statement, owner=migrated.owner_role)
+    with caplog.at_level(logging.WARNING):
+        assert _ready(migrated.runtime_url) is True
+    assert caplog.text == ""
 
 
 @pytest.mark.parametrize("credentials", ["owner", "superuser"])

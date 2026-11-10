@@ -57,8 +57,8 @@ Readiness verifies the runtime role on every probe, from its effective privilege
 - belongs to any predefined `pg_` role, such as `pg_monitor`, `pg_read_all_data` or `pg_execute_server_program`, whose powers are not recorded as grants;
 - owns the application schema, a schema on its search path, or any table, function or type in them. This includes the database owner, which owns `public`;
 - holds any grant beyond an allow-list. The allow-list is `SELECT` on `alembic_version` and `slack_workspaces`, `USAGE` on the application schema, and `CONNECT` or `TEMPORARY` on databases. Grants checked include those on tables, columns, functions, schemas, databases, types, languages, foreign servers, large objects and tablespaces, plus default privileges for future objects and user mappings. On PostgreSQL 17, `MAINTAIN` counts too;
-- can create objects in those schemas or in the database, or run a system function that is restricted by default, such as `pg_read_binary_file`, `lo_import` or `dblink_connect_u`;
-- benefits from what the deployment granted to `PUBLIC`: `CREATE` on those schemas, explicit `EXECUTE` on a system or extension function, read access to a restricted catalog such as `pg_statistic` or `pg_authid`, or (PostgreSQL 15 and later) a grant on a server parameter;
+- can create objects in those schemas or in the database;
+- benefits from anything the deployment granted to `PUBLIC` beyond what each object starts with. That baseline is the initial privileges PostgreSQL or an extension recorded, or else PostgreSQL's default for that kind of object. Examples include `EXECUTE` on `pg_read_binary_file` or `dblink_connect_u`, `SELECT` on `pg_statistic`, `USAGE` on a foreign server, a user mapping for `PUBLIC`, or (PostgreSQL 15 and later) a grant on a server parameter. Grants to other roles that merely spell out `PUBLIC`'s defaults are not flagged;
 - cannot read `slack_workspaces`, or that table has row-level security disabled.
 
 Before PostgreSQL 15, `PUBLIC` can create objects in `public` by default, so readiness reports `503` until the deployment runs `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.

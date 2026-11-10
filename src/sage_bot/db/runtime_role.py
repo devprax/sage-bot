@@ -42,12 +42,12 @@ PROBLEMS = (
     # TEMPORARY on databases. This covers every object kind with grants, column grants, default
     # privileges for future objects, and user mappings.
     "unexpected_privilege",
-    # It can run a superuser-only system function, such as reading server files, which
-    # bypasses every permission check.
-    "privileged_function",
-    # Everyone can read a catalog that is restricted by default, such as pg_statistic, which
-    # holds samples of every tenant's column values.
-    "public_catalog_access",
+    # The deployment granted PUBLIC more than an object starts with: initdb's or an
+    # extension's initial privileges, or else PostgreSQL's default for the object kind. Every
+    # role, including the runtime role, holds such grants; for example EXECUTE on
+    # pg_read_binary_file, SELECT on pg_statistic, USAGE on a foreign server, or a user
+    # mapping for PUBLIC.
+    "public_privilege",
     # It was granted a server parameter (PostgreSQL 15+), which can load code or change how
     # the server enforces permissions.
     "parameter_grant",
@@ -101,6 +101,105 @@ tables AS (
          WHERE c.relname = 'slack_workspaces') AS workspaces,
         pg_catalog.current_setting('server_version_num')::int >= 170000 AS has_maintain
 ),
+acl_objects AS (
+    -- Every object kind with grants: catalog, object, column (0 for none), the kind letter
+    -- acldefault() takes, owner, ACL, and the schema it is in (for schemas, itself).
+    SELECT 'pg_catalog.pg_class'::pg_catalog.regclass AS catalog, c.oid AS object,
+           0 AS subobject,
+           CASE WHEN c.relkind = 'S' THEN 's' ELSE 'r' END::"char" AS kind,
+           c.relowner AS owner, c.relacl AS acl, c.relnamespace AS schema
+    FROM pg_catalog.pg_class c WHERE c.relacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_class'::pg_catalog.regclass, t.attrelid, t.attnum, 'c', c.relowner,
+           t.attacl, c.relnamespace
+    FROM pg_catalog.pg_attribute t JOIN pg_catalog.pg_class c ON c.oid = t.attrelid
+    WHERE t.attacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_proc'::pg_catalog.regclass, f.oid, 0, 'f', f.proowner, f.proacl,
+           f.pronamespace
+    FROM pg_catalog.pg_proc f WHERE f.proacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_namespace'::pg_catalog.regclass, n.oid, 0, 'n', n.nspowner, n.nspacl,
+           n.oid
+    FROM pg_catalog.pg_namespace n WHERE n.nspacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_database'::pg_catalog.regclass, d.oid, 0, 'd', d.datdba, d.datacl,
+           NULL::oid
+    FROM pg_catalog.pg_database d WHERE d.datacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_type'::pg_catalog.regclass, t.oid, 0, 'T', t.typowner, t.typacl,
+           t.typnamespace
+    FROM pg_catalog.pg_type t WHERE t.typacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_language'::pg_catalog.regclass, l.oid, 0, 'l', l.lanowner, l.lanacl,
+           NULL::oid
+    FROM pg_catalog.pg_language l WHERE l.lanacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_foreign_data_wrapper'::pg_catalog.regclass, w.oid, 0, 'F',
+           w.fdwowner, w.fdwacl, NULL::oid
+    FROM pg_catalog.pg_foreign_data_wrapper w WHERE w.fdwacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_foreign_server'::pg_catalog.regclass, v.oid, 0, 'S', v.srvowner,
+           v.srvacl, NULL::oid
+    FROM pg_catalog.pg_foreign_server v WHERE v.srvacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_largeobject'::pg_catalog.regclass, m.oid, 0, 'L', m.lomowner,
+           m.lomacl, NULL::oid
+    FROM pg_catalog.pg_largeobject_metadata m WHERE m.lomacl IS NOT NULL
+    UNION ALL
+    SELECT 'pg_catalog.pg_tablespace'::pg_catalog.regclass, s.oid, 0, 't', s.spcowner, s.spcacl,
+           NULL::oid
+    FROM pg_catalog.pg_tablespace s WHERE s.spcacl IS NOT NULL
+    UNION ALL
+    -- Default privileges apply to future objects; they have no initial privileges.
+    SELECT 'pg_catalog.pg_default_acl'::pg_catalog.regclass, d.oid, 0,
+           CASE d.defaclobjtype WHEN 'S' THEN 's' ELSE d.defaclobjtype END::"char",
+           d.defaclrole, d.defaclacl, d.defaclnamespace
+    FROM pg_catalog.pg_default_acl d
+),
+grants AS (
+    -- Grants to the runtime role, a role it belongs to, or PUBLIC (grantee 0).
+    SELECT o.catalog, o.object, o.subobject, o.kind, o.owner, a.grantee, a.privilege_type,
+        -- The runtime allow-list. Never NULL, so NOT allowed is never NULL either.
+        COALESCE(
+            (o.catalog = 'pg_catalog.pg_class'::pg_catalog.regclass AND o.subobject = 0
+                AND a.privilege_type = 'SELECT'
+                AND (o.object IS NOT DISTINCT FROM tables.revision
+                     OR o.object IS NOT DISTINCT FROM tables.workspaces))
+            OR (o.catalog = 'pg_catalog.pg_namespace'::pg_catalog.regclass
+                AND a.privilege_type = 'USAGE'
+                AND o.object IN (SELECT schema_oid FROM app))
+            OR (o.catalog = 'pg_catalog.pg_database'::pg_catalog.regclass
+                AND a.privilege_type IN ('CONNECT', 'TEMPORARY')),
+            false
+        ) AS allowed,
+        -- For PUBLIC: what the object started with. Initial privileges recorded by initdb or
+        -- an extension, or else PostgreSQL's built-in default for the object kind. initdb
+        -- grants the information_schema views to PUBLIC without recording initial privileges;
+        -- those views show only what the caller may already see.
+        COALESCE((o.catalog <> 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+            AND o.schema IS NOT DISTINCT FROM 'information_schema'::pg_catalog.regnamespace
+            AND a.privilege_type IN ('SELECT', 'USAGE'))
+        OR CASE WHEN o.catalog = 'pg_catalog.pg_default_acl'::pg_catalog.regclass
+                  OR NOT EXISTS (
+                      SELECT 1 FROM pg_catalog.pg_init_privs i
+                      WHERE i.classoid = o.catalog AND i.objoid = o.object
+                        AND i.objsubid = o.subobject
+                  )
+            THEN EXISTS (
+                SELECT 1 FROM pg_catalog.aclexplode(pg_catalog.acldefault(o.kind, o.owner)) d
+                WHERE d.grantee = 0 AND d.privilege_type = a.privilege_type
+            )
+            ELSE EXISTS (
+                SELECT 1 FROM pg_catalog.pg_init_privs i, pg_catalog.aclexplode(i.initprivs) d
+                WHERE i.classoid = o.catalog AND i.objoid = o.object
+                  AND i.objsubid = o.subobject
+                  AND d.grantee = 0 AND d.privilege_type = a.privilege_type
+            )
+        END, false) AS initial
+    FROM acl_objects o, tables, pg_catalog.aclexplode(o.acl) a
+    WHERE a.grantee = 0 OR a.grantee IN (SELECT oid FROM held)
+),
 writes AS (
     SELECT
         EXISTS (
@@ -137,85 +236,18 @@ SELECT pg_catalog.concat_ws(',',
     ) THEN 'server_files_or_programs' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolname = 'pg_signal_backend')
         THEN 'signal_backend' END,
-    CASE WHEN EXISTS (
-        SELECT 1 FROM pg_catalog.pg_proc f, held
-        WHERE f.pronamespace = 'pg_catalog'::pg_catalog.regnamespace
-          -- Restricted by default: PUBLIC lacks EXECUTE, so a grant is deliberate.
-          AND f.proacl IS NOT NULL
-          AND NOT pg_catalog.has_function_privilege('public', f.oid, 'EXECUTE')
-          AND pg_catalog.has_function_privilege(held.oid, f.oid, 'EXECUTE')
-    ) OR EXISTS (
-        -- No system or extension function grants EXECUTE to PUBLIC explicitly by default.
-        SELECT 1 FROM pg_catalog.pg_proc f, pg_catalog.aclexplode(f.proacl) a
-        WHERE a.grantee = 0
-          AND (f.pronamespace = 'pg_catalog'::pg_catalog.regnamespace OR EXISTS (
-              SELECT 1 FROM pg_catalog.pg_depend d
-              WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
-                AND d.objid = f.oid
-                AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
-                AND d.deptype = 'e'
-          ))
-    ) THEN 'privileged_function' END,
-    CASE WHEN EXISTS (
-        SELECT 1 FROM pg_catalog.unnest(ARRAY[
-            'pg_catalog.pg_authid', 'pg_catalog.pg_shadow', 'pg_catalog.pg_statistic',
-            'pg_catalog.pg_statistic_ext_data', 'pg_catalog.pg_user_mapping',
-            'pg_catalog.pg_largeobject'
-        ]) AS name
-        WHERE pg_catalog.has_table_privilege(
-            'public', pg_catalog.to_regclass(name), 'SELECT'
-        )
-    ) OR pg_catalog.has_column_privilege(
-        'public', 'pg_catalog.pg_subscription'::pg_catalog.regclass, 'subconninfo', 'SELECT'
-    ) THEN 'public_catalog_access' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE pg_catalog.starts_with(rolname, 'pg_'))
         THEN 'predefined_role' END,
     CASE WHEN EXISTS (
-        SELECT 1 FROM pg_catalog.pg_class c, tables, pg_catalog.aclexplode(c.relacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-          AND NOT (
-              a.privilege_type = 'SELECT'
-              AND (c.oid IS NOT DISTINCT FROM tables.revision
-                   OR c.oid IS NOT DISTINCT FROM tables.workspaces)
-          )
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_attribute t, pg_catalog.aclexplode(t.attacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_proc f, pg_catalog.aclexplode(f.proacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-          AND NOT (a.privilege_type = 'USAGE' AND n.oid IN (SELECT schema_oid FROM app))
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-          AND a.privilege_type NOT IN ('CONNECT', 'TEMPORARY')
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_type t, pg_catalog.aclexplode(t.typacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_language l, pg_catalog.aclexplode(l.lanacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_foreign_data_wrapper w, pg_catalog.aclexplode(w.fdwacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_foreign_server v, pg_catalog.aclexplode(v.srvacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_largeobject_metadata m, pg_catalog.aclexplode(m.lomacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_tablespace s, pg_catalog.aclexplode(s.spcacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_default_acl d, pg_catalog.aclexplode(d.defaclacl) a
-        WHERE a.grantee IN (SELECT oid FROM held)
-        UNION ALL
-        SELECT 1 FROM pg_catalog.pg_user_mappings m
-        WHERE m.umuser IN (SELECT oid FROM held)
+        SELECT 1 FROM grants WHERE grantee <> 0 AND NOT allowed
+    ) THEN 'unexpected_privilege' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM grants WHERE grantee = 0 AND NOT allowed AND NOT initial
+    ) OR EXISTS (
+        SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser = 0
+    ) THEN 'public_privilege' END,
+    CASE WHEN EXISTS (
+        SELECT 1 FROM pg_catalog.pg_user_mappings m WHERE m.umuser IN (SELECT oid FROM held)
     ) THEN 'unexpected_privilege' END,
     CASE WHEN EXISTS (SELECT 1 FROM schemas JOIN held ON held.oid = schemas.nspowner)
         THEN 'owns_schema' END,
