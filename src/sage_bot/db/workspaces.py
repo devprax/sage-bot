@@ -45,6 +45,8 @@ CONNECT_TIMEOUT_SECONDS = 10
 # Default bound for one lookup. Releasing a stalled connection can add up to
 # 2 * connections.CLEANUP_SECONDS beyond it.
 RESOLVE_TIMEOUT_SECONDS = 2.0
+# PostgreSQL's largest statement_timeout, in milliseconds.
+STATEMENT_TIMEOUT_MAX_MS = 2_147_483_647
 
 
 @asynccontextmanager
@@ -216,18 +218,23 @@ async def _resolve(
 ) -> UUID | None:
     # A session setting rather than a connection option, which would replace any options the
     # deployment put in DATABASE_URL. It only ever lowers the deployment's own limit (0 means
-    # none); pg_settings reports statement_timeout in milliseconds.
-    timeout_ms = max(1, math.ceil(remaining_seconds * 1000))
+    # none); pg_settings reports statement_timeout in milliseconds. Types and operators are
+    # qualified, so objects elsewhere on the search path cannot stand in for them.
+    timeout_ms = min(max(1, math.ceil(remaining_seconds * 1000)), STATEMENT_TIMEOUT_MAX_MS)
     await connection.execute(
-        """SELECT pg_catalog.set_config('statement_timeout', (
-               SELECT CASE WHEN s.setting::int > 0 AND s.setting::int <= %(limit)s
-                           THEN s.setting ELSE %(limit)s::text END
-               FROM pg_catalog.pg_settings s WHERE s.name = 'statement_timeout'
-           ), false)""",
+        """SELECT pg_catalog.set_config('statement_timeout', CASE
+               WHEN s.setting::pg_catalog.int4 OPERATOR(pg_catalog.>) 0
+                AND s.setting::pg_catalog.int4
+                    OPERATOR(pg_catalog.<=) %(limit)s::pg_catalog.int4
+               THEN s.setting ELSE %(limit)s::pg_catalog.text END, false)
+           FROM pg_catalog.pg_settings s
+           WHERE s.name OPERATOR(pg_catalog.=) 'statement_timeout'::pg_catalog.text""",
         {"limit": timeout_ms},
     )
     # The cast selects the text signature exactly; readiness checks what it resolves to.
-    cursor = await connection.execute("SELECT resolve_slack_workspace(%s::text)", (team,))
+    cursor = await connection.execute(
+        "SELECT resolve_slack_workspace(%s::pg_catalog.text)", (team,)
+    )
     row = await cursor.fetchone()
     value = None if row is None else row[0]
     if value is not None and not isinstance(value, UUID):

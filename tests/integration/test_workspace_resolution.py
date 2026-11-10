@@ -350,6 +350,27 @@ def test_a_function_planted_earlier_on_the_search_path_is_reported(
     assert "resolver_shadowed" in caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
 
 
+def test_built_in_names_overridden_on_the_search_path(
+    migrated: TenantDatabase, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With pg_catalog listed after public, unqualified built-in names resolve to objects in
+    public first. The lookup qualifies its own, and readiness reports the configuration."""
+    enabled = _register(migrated.owner_url, TEAM_A, enabled=True)
+    _admin(migrated, "CREATE DOMAIN public.text AS pg_catalog.text CHECK (false)")
+    url = f"{migrated.runtime_url}?options=-csearch_path%3Dpublic,pg_catalog"
+    assert _resolve(url, TEAM_A) == enabled
+    with caplog.at_level(logging.WARNING):
+        assert _ready(url) is False
+    assert "search_path_overrides_catalog" in caplog.text.split(UNSAFE, 1)[1].splitlines()[0]
+    # Listed first, or not at all, it is searched before anything else.
+    assert _ready(f"{migrated.runtime_url}?options=-csearch_path%3Dpg_catalog,public") is True
+
+
+def test_a_long_timeout_is_capped_at_the_server_maximum(migrated: TenantDatabase) -> None:
+    enabled = _register(migrated.owner_url, TEAM_A, enabled=True)
+    assert _resolve(migrated.runtime_url, TEAM_A, timeout_seconds=3e6) == enabled
+
+
 def test_the_migration_refuses_tables_split_across_schemas(
     tenant_database: TenantDatabase,
 ) -> None:

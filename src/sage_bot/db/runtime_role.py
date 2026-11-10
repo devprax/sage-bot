@@ -21,6 +21,10 @@ PROBLEMS = (
     # The session switched to another role (for example a role's default `SET ROLE`), so the
     # privileges in effect are not those of the login role it can switch back to.
     "session_role_differs",
+    # pg_catalog is listed explicitly on the search path after another schema, so objects
+    # there could stand in for built-in types, operators and functions, in this check and in
+    # the application's queries. Unlisted, pg_catalog is searched first.
+    "search_path_overrides_catalog",
     # A role it belongs to can bypass row-level security or every permission check.
     "superuser",
     "bypassrls",
@@ -120,7 +124,8 @@ tables AS (
         -- Identified by schema, name and argument types, never by name alone.
         (SELECT p.oid FROM pg_catalog.pg_proc p JOIN app ON p.pronamespace = app.schema_oid
          WHERE p.proname = 'resolve_slack_workspace' AND p.prokind = 'f'
-           AND pg_catalog.oidvectortypes(p.proargtypes) = 'text') AS resolver,
+           AND p.pronargs = 1
+           AND p.proargtypes[0] = 'pg_catalog.text'::pg_catalog.regtype) AS resolver,
         pg_catalog.current_setting('server_version_num')::int >= 170000 AS has_maintain
 ),
 acl_objects AS (
@@ -257,6 +262,10 @@ writes AS (
     FROM tables
 )
 SELECT pg_catalog.concat_ws(',',
+    -- Qualified throughout: it guards the rest of this query.
+    CASE WHEN pg_catalog.array_position(
+        pg_catalog.current_schemas(false), 'pg_catalog'::pg_catalog.name
+    ) OPERATOR(pg_catalog.>) 1 THEN 'search_path_overrides_catalog' END,
     CASE WHEN current_user <> session_user THEN 'session_role_differs' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolsuper) THEN 'superuser' END,
     CASE WHEN EXISTS (SELECT 1 FROM held WHERE rolbypassrls) THEN 'bypassrls' END,

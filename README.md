@@ -54,6 +54,7 @@ GRANT EXECUTE ON FUNCTION resolve_slack_workspace(text) TO sage_runtime;
 Readiness verifies the runtime role on every probe, from its effective privileges rather than its name. The privileges of every role it belongs to count too, whether that membership confers them by inheritance, by `SET ROLE` or by `ADMIN`. Readiness reports `503` if the role:
 
 - runs as a role other than its login role, for example through a default `SET ROLE`;
+- lists `pg_catalog` explicitly on its search path after another schema, so objects there could stand in for built-in types, operators and functions (left unlisted, `pg_catalog` is searched first);
 - has, directly or through a role it belongs to, superuser, `BYPASSRLS`, `REPLICATION`, `CREATEROLE` or `CREATEDB`;
 - belongs to any predefined `pg_` role, such as `pg_monitor`, `pg_read_all_data` or `pg_execute_server_program`, whose powers are not recorded as grants;
 - owns the application schema, a schema on its search path, or any table, function or type in them. This includes the database owner, which owns `public`;
@@ -69,6 +70,8 @@ Readiness verifies the runtime role on every probe, from its effective privilege
 Before PostgreSQL 15, `PUBLIC` can create objects in `public` by default, so readiness reports `503` until the deployment runs `REVOKE CREATE ON SCHEMA public FROM PUBLIC`.
 
 The check covers the runtime role's own privileges. It does not audit what the trusted owner grants or defines, such as additional row-level security policies, or views and `SECURITY DEFINER` functions that expose rows. Functions the owner defines must revoke `EXECUTE` from `PUBLIC` unless every role may run them. PostgreSQL records an extension's current privileges as its initial privileges when the extension is updated, so a grant to `PUBLIC` made before an `ALTER EXTENSION … UPDATE` is no longer reported.
+
+Readiness and the workspace lookup set session-level options (`jit`, `statement_timeout`) on their own connections, so `DATABASE_URL` must not point at a transaction-level connection pooler, which would carry those settings into other clients' sessions.
 
 The problem is logged as a fixed code, such as `owns_relation`, without role names or connection values. Liveness is unaffected.
 
